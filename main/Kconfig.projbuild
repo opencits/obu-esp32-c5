@@ -1,0 +1,71 @@
+menu "OBU-ESP32 Configuration"
+
+    orsource "$IDF_PATH/examples/common_components/env_caps/$IDF_TARGET/Kconfig.env_caps"
+
+    config HW_VARIANT
+        string "Hardware variant"
+        default "custom"
+        help
+            Any hardware with the same HW_VARIANT is assumed to be binary compatible and can receive OTA updates.
+            If you set this to "custom", this means that the hardware is not binary compatible with any other known
+            hardware, and you will not receive (potentially incompatible) OTA updates.
+
+    config SNIFFER_STORE_HISTORY
+        bool "Store command history into flash"
+        default y
+        help
+            Linenoise line editing library provides functions to save and load command history.
+            If this option is enabled, initializes a FAT filesystem and uses it to store command history.
+
+    choice SNIFFER_PCAP_DESTINATION
+        prompt "Select destination to store pcap file"
+        default SNIFFER_PCAP_DESTINATION_MEMORY
+        help
+            Select where to store the pcap file.
+            Currently support storing to host via JTAG interface with 'Trace memory' enabled, or to memory.
+        config SNIFFER_PCAP_DESTINATION_JTAG
+            bool "JTAG (App Trace)"
+            depends on APPTRACE_DEST_JTAG
+            help
+                Store pcap file to host via JTAG interface.
+        config SNIFFER_PCAP_DESTINATION_MEMORY
+            bool "Memory"
+            help
+                Store pcap file to memory.
+    endchoice
+
+    if SNIFFER_PCAP_DESTINATION_MEMORY
+        config SNIFFER_PCAP_MEMORY_SIZE
+            int "Memory size of the '.pcap' file in memory"
+            default 4096
+            help
+                Max memory size to storage packet in memory.
+    endif
+
+    config SNIFFER_WORK_QUEUE_LEN
+        int "Length of sniffer work queue"
+        default 128
+        help
+            The sniffer callback function should not do heavy work, so we put all heavy IO operation to another task.
+            The task gets some basic info of sniffer packet via queue.
+            Here you should specify the length of queue.
+
+    config SNIFFER_TASK_STACK_SIZE
+        int "Stack size of sniffer task"
+        default 4096
+        help
+            Stack size of sniffer task.
+
+    config SNIFFER_TASK_PRIORITY
+        int "Priority of sniffer task"
+        default 2
+        help
+            Priority of sniffer task.
+
+    config LEDSTRIP_PIN
+        int "LED strip pin"
+        range ENV_GPIO_RANGE_MIN ENV_GPIO_OUT_RANGE_MAX
+        default 26
+        help
+            GPIO number where the LED strip is connected
+endmenu

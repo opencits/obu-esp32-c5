@@ -1,0 +1,10 @@
+/build/
+/managed_components/
+/.qtcreator/
+/.clion-idf-env.sh
+/dependencies.lock
+/sdkconfig.old
+*.pcap
+
+venv/
+.idea/

@@ -1,0 +1,13 @@
+*.bin filter=lfs diff=lfs merge=lfs -text
+*.tar.bz2 filter=lfs diff=lfs merge=lfs -text
+*.tgz filter=lfs diff=lfs merge=lfs -text
+*.tar.gz filter=lfs diff=lfs merge=lfs -text
+*.rom filter=lfs diff=lfs merge=lfs -text
+*.zip filter=lfs diff=lfs merge=lfs -text
+*.o filter=lfs diff=lfs merge=lfs -text
+*.ko filter=lfs diff=lfs merge=lfs -text
+*.pdf filter=lfs diff=lfs merge=lfs -text lockable
+*.jar filter=lfs diff=lfs merge=lfs -text lockable
+*.imx filter=lfs diff=lfs merge=lfs -text
+*.xz filter=lfs diff=lfs merge=lfs -text
+*.gz filter=lfs diff=lfs merge=lfs -text

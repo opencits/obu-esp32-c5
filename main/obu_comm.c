@@ -1,0 +1,258 @@
+#include "obu_comm.h"
+
+#include <stdbool.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "esp_log.h"
+#include "esp_system.h"
+#include "esp_wifi.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "config.h"
+
+static const char TAG[] = "OBU_COMM";
+
+void obu_comm_reassembler_init(obu_comm_reassembler_t *r, uint8_t *buf, size_t buf_size)
+{
+    r->buf = buf;
+    r->buf_size = buf_size;
+    r->end = 0;
+    r->payloadType = -1;
+    r->payloadLen = 0;
+    r->seqNo = 0;
+}
+
+static void parse(obu_comm_reassembler_t *r, obu_comm_frame_fn on_frame, void *ctx)
+{
+    while (true)
+    {
+        int available = r->end;
+        if (r->payloadType < 0)
+        {
+            // no valid header yet detected
+            if (available < (int)sizeof(CommHeader))
+            {
+                break;
+            }
+
+            const CommHeader* hdr = (const CommHeader*)r->buf;
+            if (ntohs(hdr->magic) != COMM_MAGIC)
+            {
+                ESP_LOGW(TAG, "Invalid Magic %x [%d]", ntohs(hdr->magic), r->seqNo);
+                r->payloadType = -1;
+                r->payloadLen = 0;
+                r->end = 0;
+                break;
+            }
+
+            uint16_t seqNo = ntohs(hdr->seqNo);
+            r->payloadType = ntohs(hdr->xferHeader.type);
+            r->payloadLen  = ntohs(hdr->xferHeader.length);
+            if (r->payloadLen > (int)r->buf_size)
+            {
+                ESP_LOGW(TAG, "Length exceeded [%d:%d]", seqNo, r->seqNo);
+                r->payloadType = -1;
+                r->payloadLen = 0;
+                r->end = 0;
+                break;
+            }
+
+            // checking SeqNo
+            if (r->seqNo != 0 && (r->seqNo + 1) != seqNo)
+            {
+                ESP_LOGI(TAG, "SeqNo check failed [%d:%d]", seqNo, r->seqNo);
+            }
+            r->seqNo = seqNo;
+
+            int thisFrameLen = r->payloadLen + (int)sizeof(CommHeader);
+            if (available > thisFrameLen)
+            {
+                // more than one frame available
+                on_frame((uint16_t)r->payloadType, (uint16_t)r->payloadLen,
+                         r->buf + sizeof(CommHeader), ctx);
+                r->payloadType = -1;
+                r->payloadLen = 0;
+                r->end = 0;
+
+                // move remainder to buffer head
+                int remaining = available - thisFrameLen;
+                memmove(r->buf, r->buf + thisFrameLen, remaining);
+                r->end = remaining;
+            }
+            else if (available == thisFrameLen)
+            {
+                // received full frame
+                on_frame((uint16_t)r->payloadType, (uint16_t)r->payloadLen,
+                         r->buf + sizeof(CommHeader), ctx);
+                r->payloadType = -1;
+                r->payloadLen = 0;
+                r->end = 0;
+            }
+        }
+        else
+        {
+            // at least header already read
+            // check if read fetched more than one frame
+            int thisFrameLen = r->payloadLen + (int)sizeof(CommHeader);
+            if (available > thisFrameLen)
+            {
+                on_frame((uint16_t)r->payloadType, (uint16_t)r->payloadLen,
+                         r->buf + sizeof(CommHeader), ctx);
+                r->payloadType = -1;
+                r->payloadLen = 0;
+
+                // move remainder to buffer head
+                int remaining = available - thisFrameLen;
+                memmove(r->buf, r->buf + thisFrameLen, remaining);
+                r->end = remaining;
+            }
+            // check for full frame
+            else if (available == thisFrameLen)
+            {
+                on_frame((uint16_t)r->payloadType, (uint16_t)r->payloadLen,
+                         r->buf + sizeof(CommHeader), ctx);
+                r->payloadType = -1;
+                r->payloadLen = 0;
+                r->end = 0;
+                break;
+            }
+            else
+            {
+                break;
+            }
+        }
+    }
+}
+
+void obu_comm_feed(obu_comm_reassembler_t *r, const uint8_t *data, int len,
+                    obu_comm_frame_fn on_frame, void *ctx)
+{
+    if (len <= 0) return;
+    if (r->end + len > (int)r->buf_size) {
+        ESP_LOGW(TAG, "feed overflow, resetting reassembler");
+        r->end = 0;
+        r->payloadType = -1;
+        r->payloadLen = 0;
+        return;
+    }
+    memcpy(r->buf + r->end, data, len);
+    r->end += len;
+    parse(r, on_frame, ctx);
+}
+
+void obu_comm_feed_inplace(obu_comm_reassembler_t *r, int len,
+                            obu_comm_frame_fn on_frame, void *ctx)
+{
+    if (len <= 0) return;
+    if (r->end + len > (int)r->buf_size) {
+        ESP_LOGW(TAG, "feed_inplace overflow, resetting reassembler");
+        r->end = 0;
+        r->payloadType = -1;
+        r->payloadLen = 0;
+        return;
+    }
+    r->end += len;
+    parse(r, on_frame, ctx);
+}
+
+/* ── Config command sub-protocol ────────────────────────────────────────
+ * Protocol: wizard sends  "CFG:key=value\n"
+ *           device replies "CFG_OK:key\n" or "CFG_ERR:message\n"
+ * Keys map directly to NVS keys used by config.c (namespace "its").
+ * ──────────────────────────────────────────────────────────────────────*/
+
+/* Map key name → config_index_t */
+static int cfg_key_to_index(const char *key)
+{
+    /* string keys */
+    if (!strcmp(key, "nodeid"))    return CONFIG_INDEX_NODEID;
+    if (!strcmp(key, "mqtturi"))   return CONFIG_INDEX_MQTT_URI;
+    if (!strcmp(key, "wifi1ssid")) return CONFIG_INDEX_WIFI1_SSID;
+    if (!strcmp(key, "wifi1pass")) return CONFIG_INDEX_WIFI1_PASS;
+    if (!strcmp(key, "wifi2ssid")) return CONFIG_INDEX_WIFI2_SSID;
+    if (!strcmp(key, "wifi2pass")) return CONFIG_INDEX_WIFI2_PASS;
+    if (!strcmp(key, "wifiip"))    return CONFIG_INDEX_WIFI_IP;
+    if (!strcmp(key, "wifinm"))    return CONFIG_INDEX_WIFI_NM;
+    if (!strcmp(key, "wifigw"))    return CONFIG_INDEX_WIFI_GW;
+    if (!strcmp(key, "wifidns"))   return CONFIG_INDEX_WIFI_DNS;
+    /* u8 keys */
+    if (!strcmp(key, "wifiopen"))  return CONFIG_INDEX_WIFI_OPEN;
+    if (!strcmp(key, "connmode"))  return CONFIG_INDEX_CONN_MODE;
+    if (!strcmp(key, "sniffmode")) return CONFIG_INDEX_SNIFF_MODE;
+    /* u32 keys */
+    if (!strcmp(key, "sniffms"))   return CONFIG_INDEX_SNIFF_MS;
+    if (!strcmp(key, "wifims"))    return CONFIG_INDEX_WIFI_MS;
+    return -1;
+}
+
+static bool is_u8_key(const char *key)
+{
+    return !strcmp(key,"wifiopen") || !strcmp(key,"connmode") || !strcmp(key,"sniffmode");
+}
+static bool is_u32_key(const char *key)
+{
+    return !strcmp(key,"sniffms") || !strcmp(key,"wifims");
+}
+
+static bool handle_config_command(char *line)
+{
+    /* Expect "CFG:key=value" */
+    if (strncmp(line, "CFG:", 4) != 0) return false;
+    char *kv = line + 4;
+    char *eq = strchr(kv, '=');
+    if (!eq) { ESP_LOGW(TAG, "CFG: no equals in '%s'", line); return false; }
+    *eq = '\0';
+    char *key = kv, *val = eq + 1;
+
+    int idx = cfg_key_to_index(key);
+    if (idx < 0) { ESP_LOGW(TAG, "CFG: unknown key '%s'", key); return false; }
+
+    esp_err_t err;
+    if (is_u8_key(key)) {
+        uint8_t v = (uint8_t)atoi(val);
+        err = config_set_u8((config_index_t)idx, v);
+    } else if (is_u32_key(key)) {
+        uint32_t v = (uint32_t)atol(val);
+        err = config_set_u32((config_index_t)idx, v);
+    } else {
+        err = config_set_str((config_index_t)idx, val);
+    }
+    return (err == ESP_OK);
+}
+
+void obu_comm_process_frame(uint16_t type, uint16_t length, uint8_t *payload,
+                             obu_comm_reply_fn reply, void *ctx)
+{
+    uint16_t replyType = 0;
+
+    switch (type) {
+        case COMM_FRAME_PING:
+            replyType = COMM_FRAME_PONG;
+            break;
+        case COMM_FRAME_PONG:
+            ESP_LOGI(TAG, "Received PONG from host");
+            return;
+        case COMM_FRAME_CMD_REBOOT:
+            replyType = COMM_FRAME_CMD_GOOD;
+            reply(replyType, NULL, 0, ctx);
+            vTaskDelay(pdMS_TO_TICKS(150));
+            esp_restart();
+            return;
+        case COMM_FRAME_CMD_CONFIG: {
+            /* payload is exactly `length` bytes with no guaranteed trailing
+             * NUL — copy into a bounded, NUL-terminated buffer before the
+             * string-based CFG:key=value parser runs (untrusted over BLE). */
+            char cmdbuf[300];
+            uint16_t n = (length < sizeof(cmdbuf) - 1) ? length : (uint16_t)(sizeof(cmdbuf) - 1);
+            memcpy(cmdbuf, payload, n);
+            cmdbuf[n] = '\0';
+            replyType = handle_config_command(cmdbuf) ? COMM_FRAME_CMD_GOOD : COMM_FRAME_CMD_FAIL;
+            break;
+        }
+        default:
+            return;
+    }
+    reply(replyType, NULL, 0, ctx);
+}

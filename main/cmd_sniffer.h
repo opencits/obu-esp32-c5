@@ -39,6 +39,8 @@ void sniffer_init(void);
 void register_sniffer_cmd(void);
 void sniffer_autostart(void);
 
+bool sniffer_set_tx_power(int8_t txpower);
+
 /* Time-slice the radio with BLE: pause releases the RF (promisc off, 802.11p
  * PHY off, esp_wifi_stop), resume re-applies the sniffer's state. The sniffer
  * task keeps running between calls — it just sees no RX callbacks while paused.

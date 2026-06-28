@@ -55,15 +55,15 @@ static SemaphoreHandle_t sem_task_over;
 
 static esp_err_t sniffer_stop();
 
-static void queue_packet(void *recv_packet, uint16_t len, const CommRecvHeader *packet_info)
+static void queue_packet(void *recv_packet, uint16_t len, const CommFrameHeader *packet_info)
 {
     sniffer_packet_t packet;
     /* Copy a packet from Link Layer driver and queue the copy to be processed by sniffer task */
-    packet.payload = malloc(sizeof(CommRecvHeader) + len);
-    packet.length = sizeof(CommRecvHeader) + len;
+    packet.payload = malloc(sizeof(CommFrameHeader) + len);
+    packet.length = sizeof(CommFrameHeader) + len;
     if (packet.payload) {
-        memcpy(packet.payload, packet_info, sizeof(CommRecvHeader));
-        memcpy(packet.payload + sizeof(CommRecvHeader), recv_packet, len);
+        memcpy(packet.payload, packet_info, sizeof(CommFrameHeader));
+        memcpy(packet.payload + sizeof(CommFrameHeader), recv_packet, len);
         if (work_queue) {
             /* send packet_info */
             if (xQueueSend(work_queue, &packet, pdMS_TO_TICKS(SNIFFER_PROCESS_PACKET_TIMEOUT_MS)) != pdTRUE) {
@@ -78,7 +78,7 @@ static void queue_packet(void *recv_packet, uint16_t len, const CommRecvHeader *
 
 static void wifi_sniffer_cb(void *recv_buf, wifi_promiscuous_pkt_type_t type)
 {
-    CommRecvHeader packet_info;
+    CommFrameHeader packet_info;
     uint16_t payloadLen;
     wifi_promiscuous_pkt_t *packet = (wifi_promiscuous_pkt_t *)recv_buf;
     /* prepare packet_info */
@@ -86,7 +86,8 @@ static void wifi_sniffer_cb(void *recv_buf, wifi_promiscuous_pkt_type_t type)
     packet_info.microseconds = htonl(packet->rx_ctrl.timestamp % 1000000U);
     packet_info.channel = (uint8_t)packet->rx_ctrl.channel;
     packet_info.rate = (uint8_t)packet->rx_ctrl.rate;
-    packet_info.rssi = (int8_t)packet->rx_ctrl.rssi;
+    packet_info.rssi_power = (int8_t)packet->rx_ctrl.rssi;
+    packet_info.noise = (int8_t)packet->rx_ctrl.noise_floor;
 
 #if CONFIG_SOC_WIFI_HE_SUPPORT
     payloadLen = packet->rx_ctrl.dump_len;
@@ -287,6 +288,25 @@ static int do_sniffer_cmd(int argc, char **argv)
 
     /* start sniffer */
     sniffer_start();
+
+    int8_t tx_power;
+    ret = config_get_i8(CONFIG_INDEX_WIFI_TX_POWER, &tx_power);
+    if (ret == ESP_OK)
+    {
+        if (tx_power < 2 || tx_power > 20) {
+            ESP_LOGE(TAG, "TX power invalid: %d", tx_power);
+        }
+        else {
+            ret = esp_wifi_set_max_tx_power(tx_power * 4);
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "esp_wifi_set_max_tx_power failed: %s", ret);
+            }
+        }
+    }
+    ret = esp_wifi_get_max_tx_power(&tx_power);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "Current TX power: %d", tx_power);
+    }
     return 0;
 }
 
@@ -375,4 +395,8 @@ void sniffer_resume(void)
     esp_wifi_set_channel(140, WIFI_SECOND_CHAN_NONE);
     phy_change_channel(channel, 1, 0, 0);
     s_paused = false;
+}
+
+bool sniffer_set_tx_power(int8_t tx_power) {
+    return esp_wifi_set_max_tx_power(tx_power * 4) == ESP_OK;
 }

@@ -35,12 +35,12 @@ typedef struct
 typedef struct {
   uint8_t channel;
   uint8_t rate;
-  int8_t rssi;
+  int8_t rssi_power;
   int8_t noise;
   uint32_t seconds;
   uint32_t microseconds;
   uint16_t frameLen;
-} __packed CommRecvHeader;
+} __packed CommFrameHeader;
 
 /* Per-channel state for obu_comm_feed(); USB and BLE each keep their own
  * instance over their own buffer since the two links reassemble independently. */

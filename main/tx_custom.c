@@ -1,7 +1,11 @@
 #include "esp_private/wifi_os_adapter.h"
 #include "esp_wifi.h"
+#include "esp_log.h"
 
 #include "tx_custom.h"
+#include "obu_comm.h"
+
+static const char TAG[] = "OBU_TX";
 
 esp_err_t ieee80211_raw_frame_sanity_check(wifi_interface_t ifx, const void *buffer, int32_t len, bool en_sys_seq);
 esp_err_t ieee80211_post_hmac_tx(void *ebuf);
@@ -91,7 +95,13 @@ typedef struct x_ebuf
 } x_ebuf_t;
 static_assert(sizeof(x_ebuf_t) == 0x40);
 
-esp_err_t esp_wifi_80211_tx_custom(wifi_interface_t ifx, const void *buffer, int32_t len, bool en_sys_seq, wifi_tx_rate_config_t *tx_rate_config, wifi_band_t band, wifi_bandwidth_t bw)
+esp_err_t esp_wifi_80211_tx_custom(wifi_interface_t ifx,
+    const void *buffer,
+    int32_t len,
+    bool en_sys_seq,
+    const wifi_tx_rate_config_t *tx_rate_config,
+    wifi_band_t band,
+    wifi_bandwidth_t bw)
 {
     esp_err_t result = 0;//ieee80211_raw_frame_sanity_check(ifx, buffer, len, en_sys_seq);
 
@@ -156,4 +166,27 @@ esp_err_t esp_wifi_80211_tx_custom(wifi_interface_t ifx, const void *buffer, int
     }
 
     return result;
+}
+
+const wifi_tx_rate_config_t tx_rate_config =
+{
+    .phymode = WIFI_PHY_MODE_11A,
+    .rate = WIFI_PHY_RATE_6M,
+    .ersu = false,
+    .dcm = false
+};
+
+void handle_tx_frame(uint8_t *payload, uint16_t length)
+{
+    esp_err_t rc = esp_wifi_80211_tx_custom(WIFI_IF_STA,
+        payload,
+        length,
+        false,
+        &tx_rate_config,
+        WIFI_BAND_5G,
+        WIFI_BW20);
+
+    if (rc != ESP_OK) {
+        ESP_LOGW(TAG, "frame tx failed: %s", esp_err_to_name(rc));
+    }
 }

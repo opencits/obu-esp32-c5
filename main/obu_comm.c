@@ -11,6 +11,7 @@
 #include "freertos/task.h"
 
 #include "config.h"
+#include "tx_custom.h"
 
 static const char TAG[] = "OBU_COMM";
 
@@ -251,7 +252,12 @@ void obu_comm_process_frame(uint16_t type, uint16_t length, uint8_t *payload,
             replyType = handle_config_command(cmdbuf) ? COMM_FRAME_CMD_GOOD : COMM_FRAME_CMD_FAIL;
             break;
         }
+        case COMM_FRAME_TX:
+            handle_tx_frame(payload, length);
+            return;
+
         default:
+            ESP_LOGW(TAG, "Received unknown frame type: %d", type);
             return;
     }
     reply(replyType, NULL, 0, ctx);

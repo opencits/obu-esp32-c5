@@ -54,7 +54,10 @@ the standard ETSI ITS-G5 control/service channel frequencies. The middle two arg
 
 ## TX side: `tx_custom.c`
 
-Everything above is RX. `main/tx_custom.c::esp_wifi_80211_tx_custom()` is the TX-side equivalent — a hand-built, reverse-engineered clone of Espressif's internal raw-TX path, needed because the *public* `esp_wifi_80211_tx()` API doesn't expose PHY rate/mode/bandwidth control. **It has zero callers anywhere in `main/`** — pure unwired infrastructure. It also contains nothing 802.11p-specific itself; "802.11p-ness" is entirely a property of the PHY state set by `phy_11p_set`/`phy_change_channel` above — this function just transmits a raw frame at whatever rate/mode you ask for, on whatever channel the PHY is currently tuned to.
+Everything above is RX. `main/tx_custom.c` provides two functions:
+
+- **`esp_wifi_80211_tx_custom()`** — the low-level TX primitive: a hand-built, reverse-engineered clone of Espressif's internal raw-TX path, needed because the *public* `esp_wifi_80211_tx()` API doesn't expose PHY rate/mode/bandwidth control. It contains nothing 802.11p-specific itself; "802.11p-ness" is entirely a property of the PHY state set by `phy_11p_set`/`phy_change_channel` above — this function just transmits a raw frame at whatever rate/mode you ask for, on whatever channel the PHY is currently tuned to.
+- **`handle_tx_frame()`** — the caller. Receives a `CommFrameHeader + raw 802.11 frame` blob from `obu_comm_process_frame()` (dispatched on `COMM_FRAME_TX = 31`) and calls `esp_wifi_80211_tx_custom()` with the 802.11p-appropriate parameters below.
 
 **Reverse-engineered structs** (`x_eb_txdesc_t`, `x_middle_data_t`, `x_ebuf_t`, lines 14–92) mirror Espressif's internal, undocumented WiFi driver buffer/descriptor layout. Most fields are generic `field_N` offsets — only a handful (`rate`, `sched`, `timestamp`, `header_length`, `data_length`, `txdesc`) were understood well enough to name. `static_assert(sizeof(...) == 0x48/0x40/0x10)` on each is the safety net: a future ESP-IDF/blob update that changes these layouts fails the build instead of corrupting memory at runtime. The `x_` prefix marks them as the author's own approximation, not real Espressif type names.
 
@@ -74,7 +77,22 @@ Everything above is RX. `main/tx_custom.c::esp_wifi_80211_tx_custom()` is the TX
 7. Packs the interface index (`ifx`) and an `en_sys_seq` flag (driver-assigned vs caller-supplied 802.11 sequence number — a real, public-API concept too).
 8. `ieee80211_post_hmac_tx(eb)` queues it for actual over-the-air transmission; unlocks the mutex; returns `ESP_ERR_NO_MEM` if step 2's allocation failed.
 
-**To actually send 802.11p traffic**, both halves are needed: PHY tuned via `phy_11p_set`/`phy_change_channel` (this doc, above) first, then a fully-formed raw 802.11 frame buffer passed to `esp_wifi_80211_tx_custom()`. Nothing in this codebase currently does the second part.
+**802.11p TX parameters** (`handle_tx_frame`, `tx_custom.c:183–197`):
+```c
+wifi_tx_rate_config_t tx_rate_config = {
+    .phymode = WIFI_PHY_MODE_11A,   // 802.11p is 802.11a OFDM — not HT/VHT/HE
+    .rate    = WIFI_PHY_RATE_6M,    // 6 Mbps: mandatory minimum; valid 802.11p rates are 3–27 Mbps
+    .ersu    = false,
+    .dcm     = false,
+};
+esp_wifi_80211_tx_custom(WIFI_IF_STA, buf, len, false, &tx_rate_config, WIFI_BAND_5G, WIFI_BW20);
+```
+
+Key points:
+- `WIFI_PHY_MODE_11A` triggers neither the HE20 nor VHT20 flag path in `esp_wifi_80211_tx_custom`, leaving `txdesc->flags` free of modulation-scheme bits — correct for legacy OFDM.
+- `WIFI_BW20` does **not** mean the frame goes out at 20 MHz. ESP-IDF has no `WIFI_BW10`. The `bw` parameter only controls the 40 MHz bonding bit (`txdesc->field_8 bit 15`); the actual RF channel width is set globally at the PHY layer by `phy_11p_set(1, 0)` — already 10 MHz when the sniffer is running. Passing `WIFI_BW20` simply leaves the bonding bit clear.
+- `en_sys_seq = false` means the caller's frame contains its own 802.11 sequence number; the driver won't overwrite it.
+- The `CommFrameHeader` (8 bytes: `channel`, `rate`, `rssi_power`, `noise`, `seconds`, `microseconds`, `frameLen`) wraps each frame coming from the host. Its `channel`/`rate` fields are ignored for TX — `handle_tx_frame` always transmits at 6 Mbps 11A regardless of what the host sends.
 
 ## Is any of this officially supported by Espressif?
 

@@ -38,6 +38,7 @@ typedef enum {
     CONFIG_INDEX_SNIFF_MODE,   /* u8: 0=realtime 1=cycle 2=individual */
     CONFIG_INDEX_SNIFF_MS,     /* u32: sniff window ms  (default 10000) */
     CONFIG_INDEX_WIFI_MS,      /* u32: WiFi window ms   (default 2000)  */
+    CONFIG_INDEX_WIFI_TX_POWER,
 } config_index_t;
 
 #define CONFIG_WIFI_SSID_BUFFER_SIZE  33

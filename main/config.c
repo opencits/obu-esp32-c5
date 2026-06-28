@@ -15,6 +15,7 @@
 
 #include "ethernet.h"
 #include "events.h"
+#include "cmd_sniffer.h"
 
 #include "config.h"
 
@@ -58,6 +59,8 @@ static esp_err_t config_get_autostart_chan(uint32_t *autostart_chan);
 static esp_err_t config_get_broadcast_only(uint8_t *broadcast_only);
 static esp_err_t config_get_led_brightness(uint8_t *led_brightness);
 
+static esp_err_t config_set_tx_power(int8_t *tx_power);
+
 static const config_key_t config_keys[] = {
     [CONFIG_INDEX_NODEID]         = { "nodeid",           NVS_TYPE_STR, CONFIG_NODEID_BUFFER_SIZE,   config_get_node_id,        NULL },
     [CONFIG_INDEX_MQTT_URI]       = { "mqtturi",          NVS_TYPE_STR, CONFIG_MQTT_URI_BUFFER_SIZE, config_get_mqtt_uri,       NULL },
@@ -83,6 +86,7 @@ static const config_key_t config_keys[] = {
     [CONFIG_INDEX_SNIFF_MODE]    = { "sniffmode",  NVS_TYPE_U8,  0,                            NULL, NULL },
     [CONFIG_INDEX_SNIFF_MS]      = { "sniffms",    NVS_TYPE_U32, 0,                            NULL, NULL },
     [CONFIG_INDEX_WIFI_MS]       = { "wifims",     NVS_TYPE_U32, 0,                            NULL, NULL },
+    [CONFIG_INDEX_WIFI_TX_POWER] = { "txpower",    NVS_TYPE_I8,  0,                            NULL, config_set_tx_power },
 };
 #define CONFIG_KEYS_END (&config_keys[sizeof(config_keys)/sizeof(*config_keys)])
 
@@ -216,6 +220,20 @@ static esp_err_t config_get_led_brightness(uint8_t *led_brightness)
 
     *led_brightness = out;
     return ESP_OK;
+}
+
+static esp_err_t config_set_tx_power(int8_t *tx_power)
+{
+    if (*tx_power < 8 || *tx_power > 84)
+    {
+        ESP_LOGE(TAG, "Invalid tx power value: %d", *tx_power);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!sniffer_set_tx_power(*tx_power * 4))
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return config_set_i8(CONFIG_INDEX_WIFI_TX_POWER, *tx_power);
 }
 
 esp_err_t config_get_u8(config_index_t index, uint8_t *out)

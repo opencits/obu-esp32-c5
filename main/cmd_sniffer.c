@@ -35,7 +35,6 @@
 #define SNIFFER_MAX_ETH_INTFS               (3)
 #define SNIFFER_DECIMAL_NUM                 (10)
 
-
 static const char TAG[] = "SNIFFER";
 
 typedef struct {
@@ -44,6 +43,7 @@ typedef struct {
 } wlan_filter_table_t;
 
 static bool is_running;
+static bool is_verbose;
 
 static sniffer_intf_t interf;
 static uint32_t channel;
@@ -118,11 +118,11 @@ static void sniffer_task(void *)
         }
 
         usb_stream_publish_packet(&packet);
-
         bt_stream_publish_packet(&packet);
-
         esp_event_post(SNIFFER_EVENT_BASE, SNIFFER_RECEIVED_PACKET, NULL, 0, 0);
-
+        if (is_verbose) {
+            ESP_LOGI(TAG, "SNIFFER-RX: %d bytes", packet.length);
+        }
         free(packet.payload);
     }
     /* notify that sniffer task is over */
@@ -177,6 +177,7 @@ static esp_err_t sniffer_start()
 
     ESP_GOTO_ON_FALSE(!is_running, ESP_ERR_INVALID_STATE, err, TAG, "sniffer is already running");
 
+    is_verbose = false;
     is_running = true;
     ESP_GOTO_ON_FALSE(xTaskCreate(sniffer_task, "snifferT", CONFIG_SNIFFER_TASK_STACK_SIZE,
                                   NULL, CONFIG_SNIFFER_TASK_PRIORITY, &task), ESP_FAIL,
@@ -397,6 +398,3 @@ void sniffer_resume(void)
     s_paused = false;
 }
 
-bool sniffer_set_tx_power(int8_t tx_power) {
-    return esp_wifi_set_max_tx_power(tx_power * 4) == ESP_OK;
-}

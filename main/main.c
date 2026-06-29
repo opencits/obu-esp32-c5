@@ -15,6 +15,7 @@
 #include "esp_wifi.h"
 
 #include "cmd_sniffer.h"
+#include "cmd_tx.h"
 
 #include "config.h"
 #include "events.h"
@@ -145,6 +146,8 @@ void app_main(void)
     register_reboot();
 
     register_ota_cmd();
+
+    register_tx_cmd();
 
     usb_stream_init();
     usb_config_rx_start();   /* USB RX config channel for setup wizard */

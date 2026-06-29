@@ -2,6 +2,7 @@ idf_component_register(
     SRCS
         "main.c"
         "cmd_sniffer.c"
+        "cmd_tx.c"
         "config.c"
         "ethernet.c"
         "events.c"

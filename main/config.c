@@ -15,7 +15,7 @@
 
 #include "ethernet.h"
 #include "events.h"
-#include "cmd_sniffer.h"
+#include "cmd_tx.h"
 
 #include "config.h"
 
@@ -229,7 +229,7 @@ static esp_err_t config_set_tx_power(int8_t *tx_power)
         ESP_LOGE(TAG, "Invalid tx power value: %d", *tx_power);
         return ESP_ERR_INVALID_ARG;
     }
-    if (!sniffer_set_tx_power(*tx_power * 4))
+    if (!set_tx_power(*tx_power * 4))
     {
         return ESP_ERR_INVALID_STATE;
     }

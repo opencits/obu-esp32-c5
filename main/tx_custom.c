@@ -178,6 +178,15 @@ const wifi_tx_rate_config_t tx_rate_config =
 
 void handle_tx_frame(uint8_t *payload, uint16_t length)
 {
+    const CommFrameHeader* hdr = (CommFrameHeader *)payload;
+    payload += sizeof(CommFrameHeader);
+    length -= sizeof(CommFrameHeader);
+
+    if (ntohs(hdr->frameLen) != length) {
+        ESP_LOGW(TAG, "frame length mismatch: %d != %d", ntohs(hdr->frameLen), length);
+        return;
+    }
+
     esp_err_t rc = esp_wifi_80211_tx_custom(WIFI_IF_STA,
         payload,
         length,

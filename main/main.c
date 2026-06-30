@@ -22,6 +22,7 @@
 #include "led.h"
 #include "ota.h"
 #include "spi.h"
+#include "obu_wifi.h"
 #include "usb_stream.h"
 #include "bt_stream.h"
 
@@ -115,6 +116,43 @@ void register_reboot(void)
     ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
 }
 
+int cmd_log_level(int argc, char **argv)
+{
+    if (argc > 1) {
+        const char* tag = argv[1];
+        esp_log_level_t level = esp_log_level_get(tag);
+        if (level > ESP_LOG_NONE) {
+            if (argc > 2) {
+                esp_log_level_t levelNew = atoi(argv[2]);
+                if (levelNew < ESP_LOG_ERROR || levelNew > ESP_LOG_VERBOSE) {
+                    fprintf(stderr, "Invalid log level %d\n", levelNew);
+                    return 1;
+                }
+                if (levelNew != level) {
+                    esp_log_level_set(tag, levelNew);
+                }
+            }
+            fprintf(stdout, "Level(%s) = %d\n", tag, esp_log_level_get(tag));
+        }
+        else {
+            fprintf(stderr, "Tag %s is unknown\n", tag);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+void register_loglevel(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "loglevel",
+        .help = "set log level",
+        .hint = "Usage: loglevel TAG <ERROR=1 .. ESP_LOG_VERBOSE=5> ",
+        .func = &cmd_log_level,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
+}
+
 void app_main(void)
 {
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -135,6 +173,7 @@ void app_main(void)
     /*--- Initialize Console ---*/
     console_init();
 
+    wifi_init();
     sniffer_init();
     ota_init();
 
@@ -145,6 +184,8 @@ void app_main(void)
 
     register_reboot();
 
+    register_loglevel();
+
     register_ota_cmd();
 
     register_tx_cmd();
@@ -153,7 +194,7 @@ void app_main(void)
     usb_config_rx_start();   /* USB RX config channel for setup wizard */
     bt_stream_init();
 
-    sniffer_autostart();     /* start sniffer — sets phy_11p_set(1,0) */
+    wifi_autostart();     /* start WIFI — sets phy_11p_set(1,0) */
 
     usb_stream_send_ping();
 
@@ -161,6 +202,4 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_console_start_repl(repl));
 
     led_update();
-
-    ESP_ERROR_CHECK(esp_event_post(APP_EVENT_BASE, APP_BOOT_FINISHED, NULL, 0, 0));
 }

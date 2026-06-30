@@ -13,9 +13,8 @@
 #include "nvs_flash.h"
 #include "argtable3/argtable3.h"
 
-#include "ethernet.h"
 #include "events.h"
-#include "cmd_tx.h"
+#include "obu_wifi.h"
 
 #include "config.h"
 
@@ -229,10 +228,7 @@ static esp_err_t config_set_tx_power(int8_t *tx_power)
         ESP_LOGE(TAG, "Invalid tx power value: %d", *tx_power);
         return ESP_ERR_INVALID_ARG;
     }
-    if (!set_tx_power(*tx_power * 4))
-    {
-        return ESP_ERR_INVALID_STATE;
-    }
+    wifi_set_txpower(*tx_power * 4);
     return config_set_i8(CONFIG_INDEX_WIFI_TX_POWER, *tx_power);
 }
 

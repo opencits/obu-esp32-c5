@@ -1,10 +1,10 @@
 #pragma once
 
 #include <stdint.h>
-#include "cmd_sniffer.h"
+#include "obu_wifi.h"
 
 void usb_stream_init(void);
-void usb_stream_publish_packet(const sniffer_packet_t *pkt);
+void usb_stream_publish_packet(const wifi_packet_t *pkt);
 void usb_stream_send_ping(void);
 
 /**

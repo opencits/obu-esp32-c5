@@ -19,7 +19,7 @@
 #include "nvs_flash.h"
 #include "driver/usb_serial_jtag.h"
 
-#include "cmd_sniffer.h"
+#include "obu_wifi.h"
 #include "obu_comm.h"
 #include "led.h"
 
@@ -87,7 +87,6 @@ static uint16_t       s_chr_val_handle;
 static uint16_t       s_cfg_val_handle;
 static volatile bool  s_notify_enabled;
 static bool           s_ready;
-static bool           s_coex_mode;
 static QueueHandle_t  s_tx_queue;
 static QueueHandle_t  s_rx_queue;
 
@@ -412,22 +411,17 @@ static void coex_window_task(void *arg)
     (void)arg;
     /* Boot-time: give BLE the radio first so a user has a chance to
      * connect before the sniffer takes over. */
-    sniffer_pause();
+    wifi_pause();
     chunked_delay(CYC_DISC_BLE, false);
     int n = 0;
     for (;;)
     {
-        if (!s_coex_mode)
-        {
-            chunked_delay(CYC_DISC_SNIFF, false);
-            continue;
-        }
         bool connected = (s_conn_handle != BLE_HS_CONN_HANDLE_NONE);
         uint16_t sniff_ms = connected ? CYC_CONN_SNIFF : CYC_DISC_SNIFF;
         uint16_t ble_ms   = connected ? CYC_CONN_BLE   : CYC_DISC_BLE;
-        sniffer_resume();
+        wifi_resume();
         chunked_delay(sniff_ms, connected);
-        sniffer_pause();
+        wifi_pause();
         if ((n++ & 0xF) == 0) {
             ESP_LOGI(TAG, "[bt] cycle %s: sniff=%u ble=%u",
                        connected ? "CONN" : "DISC", sniff_ms, ble_ms);
@@ -529,7 +523,6 @@ static void bt_reader_task(void *arg)
 void bt_stream_init(void)
 {
     if (s_ready) return;
-    s_coex_mode = true;
 
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -606,20 +599,9 @@ void bt_stream_init(void)
     ESP_LOGI(TAG, "initialized");
 }
 
-void bt_coex_pause(void)
-{
-    s_coex_mode = false;
-}
-
-void bt_coex_resume(void)
-{
-    s_coex_mode = true;
-}
-
-void bt_stream_publish_packet(const sniffer_packet_t *pkt)
+void bt_stream_publish_packet(const wifi_packet_t *pkt)
 {
     if (!s_ready) return;
     if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE || !s_notify_enabled) return;
-
     bt_enqueue_frame(COMM_FRAME_RX, pkt->payload, pkt->length);
 }

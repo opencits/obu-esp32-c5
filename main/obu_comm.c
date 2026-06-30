@@ -11,7 +11,7 @@
 #include "freertos/task.h"
 
 #include "config.h"
-#include "tx_custom.h"
+#include "obu_wifi.h"
 
 static const char TAG[] = "OBU_COMM";
 
@@ -253,7 +253,7 @@ void obu_comm_process_frame(uint16_t type, uint16_t length, uint8_t *payload,
             break;
         }
         case COMM_FRAME_TX:
-            handle_tx_frame(payload, length);
+            wifi_tx_frame(payload, length);
             return;
 
         default:

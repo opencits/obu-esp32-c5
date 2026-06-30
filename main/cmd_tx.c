@@ -18,12 +18,24 @@
 #include "esp_wifi.h"
 #include "nvs.h"
 
-#include "tx_custom.h"
+#include "obu_wifi.h"
+#include "bt_stream.h"
 #include "cmd_tx.h"
 
 static const char TAG[] = "SNIFFER";
 
 static const char* SAMPLE_PACKET_HEX = "b47000000000000000000000007988000000ffffffffffff000000000000ffffffffffff60002100aaaa0300000089471100140120500280002f010014000064cafebabe000000001cc4ff8409c98951000000000000000007d1000002020000000000004056b49d200d693a401ffffffc23b7743e00e11fc0007e3fe9ed0737feebfff6000000";
+
+static int txInterval = -1;
+static TaskHandle_t xTxHandle = NULL;
+
+static struct {
+  struct arg_int *power;
+  struct arg_int *datarate;
+  struct arg_int *interval;
+  struct arg_lit *stop;
+  struct arg_end *end;
+} tx_args;
 
 static bool hex_decode(const char *hex, uint8_t *out, size_t *outlen)
 {
@@ -55,13 +67,22 @@ static void tx_sample_frame() {
     ESP_LOGE(TAG, "Failed to decode sample packet hex");
     return;
   }
-  handle_tx_frame(frame_buffer, frame_len);
+  wifi_tx_frame(frame_buffer, frame_len);
 }
 
-static struct {
-  struct arg_int *count;
-  struct arg_end *end;
-} tx_args;
+static void tx_task(void *arg) {
+  int countDown = -1;
+  for (;;) {
+    if (countDown > 0) {
+        countDown -= 100;
+    }
+    if (countDown <= 0 && txInterval > 0) {
+        tx_sample_frame();
+        countDown = txInterval;
+    }
+    vTaskDelay( 100 / portTICK_PERIOD_MS );
+  }
+}
 
 static int do_tx_cmd(int argc, char **argv) {
   int nerrors = arg_parse(argc, argv, (void **)&tx_args);
@@ -71,20 +92,39 @@ static int do_tx_cmd(int argc, char **argv) {
     return 0;
   }
 
-  int count = 1;
-  if (tx_args.count->count) {
-    count = tx_args.count->ival[0];
+  txInterval = 1000;
+  if (tx_args.interval->count) {
+    txInterval = tx_args.interval->ival[0];
+  }
+  if (tx_args.datarate->count) {
+    wifi_set_datarate(tx_args.datarate->ival[0]);
+  }
+  if (tx_args.power->count) {
+    wifi_set_txpower(tx_args.power->ival[0]);
+  }
+  if (tx_args.stop->count) {
+    txInterval = -1;
   }
 
-  tx_sample_frame();
-
-  fprintf(stdout, "Transmitting %d packets...\n", count);
+  if (xTxHandle ==  NULL) {
+    wifi_coex_disable();
+    xTaskCreate( tx_task, "xTx", 4096, NULL, 4, &xTxHandle);
+  }
+  if (txInterval > 0)
+    fprintf(stdout, "Transmitting every %d millis (%d * 0.25dBm)...\n",
+      txInterval,
+      wifi_get_txpower());
+  else
+    fprintf(stdout, "Transmission stopped.\n");
   return 0;
 }
 
 void register_tx_cmd(void)
 {
-  tx_args.count = arg_int0("c", "count", "<n>", "number of packets to transmit");
+  tx_args.datarate = arg_int0("r", "datarate", "<n>", "datarate");
+  tx_args.power = arg_int0("p", "power", "<dbm>", "power");
+  tx_args.interval = arg_int0("i", "interval", "<ms>", "interval");
+  tx_args.stop = arg_lit0(NULL, "stop", "stop running transmitter");
   tx_args.end = arg_end(1);
 
   const esp_console_cmd_t tx_cmd = {
@@ -95,8 +135,4 @@ void register_tx_cmd(void)
     .argtable = &tx_args
   };
   ESP_ERROR_CHECK(esp_console_cmd_register(&tx_cmd));
-}
-
-bool set_tx_power(int8_t tx_power) {
-  return esp_wifi_set_max_tx_power(tx_power * 4) == ESP_OK;
 }

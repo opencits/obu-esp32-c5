@@ -14,6 +14,7 @@
 #include "esp_coexist.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
+#include "obu_wifi.h"
 #include "obu_comm.h"
 #include "led.h"
 
@@ -47,7 +48,7 @@ void usb_stream_init(void)
     s_comm_seqno = 1;
 }
 
-void usb_stream_publish_packet(const sniffer_packet_t *pkt)
+void usb_stream_publish_packet(const wifi_packet_t *pkt)
 {
     if (!s_ready) usb_stream_init();
     if (!s_ready) return;
@@ -120,13 +121,13 @@ static void usb_config_rx_task(void *arg)
             coex_resume_count--;
             if (coex_resume_count == 0)
             {
-                bt_coex_resume();
+                wifi_coex_enable();
             }
         }
         if (numRead <= 0) continue;
 
         // got data - stop WIFI/BLE COEX poll
-        bt_coex_pause();
+        wifi_coex_disable();
         coex_resume_count = 20*30;  // Resume after 30sec
 
         /* numRead bytes were already read directly into recvBufferStart, i.e.

@@ -4,7 +4,6 @@ idf_component_register(
         "cmd_sniffer.c"
         "cmd_tx.c"
         "config.c"
-        "ethernet.c"
         "events.c"
         "led.c"
         "ota.c"
@@ -12,7 +11,7 @@ idf_component_register(
         "bt_stream.c"
         "usb_stream.c"
         "obu_comm.c"
-        "tx_custom.c"
+        "obu_wifi.c"
     PRIV_REQUIRES
         app_trace
         app_update

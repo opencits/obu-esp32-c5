@@ -8,8 +8,6 @@ extern "C" {
 
 void register_tx_cmd(void);
 
-bool set_tx_power(int8_t txpower);
-
 #ifdef __cplusplus
 }
 #endif

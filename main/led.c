@@ -41,12 +41,9 @@ static esp_timer_handle_t s_pulse_timer;
 #define LED_ETH_COLOR_100M LED_IRGB(LED_ETH,    0, 0xFF, 0)
 #define LED_ETH_COLOR_10M  LED_IRGB(LED_ETH, 0xFF, 0xA0, 0)
 
-static uint32_t system_led_state  = LED_IRGB(LED_SYSTEM,  0xFF, 0xFF, 0xFF);
 static uint32_t wifi_led_state    = LED_IRGB(LED_WIFI,    0xFF,    0,    0);
 static uint32_t cits_led_state    = LED_IRGB(LED_CITS,       0,    0,    0);
 static uint32_t comm_led_state    = LED_IRGB(LED_COMM,       0,    0,    0);
-
-static bool system_led_blink_state;
 
 static esp_timer_handle_t system_led_timer_handle;
 static esp_timer_handle_t cits_led_timer_handle;
@@ -65,12 +62,6 @@ static void set_led_with_brightness(led_indicator_handle_t handle, uint32_t irgb
     b = ((uint32_t)b) * ((uint32_t)led_brightness) / 255u;
 
     led_indicator_set_rgb(handle, SET_IRGB(i, r, g, b));
-}
-
-static void set_comm_led_destroyed(void)
-{
-    comm_led_state = LED_IRGB(LED_COMM, 0, 0, 0);
-    set_led_with_brightness(led_handle, comm_led_state);
 }
 
 static void set_comm_led_disconnected(void)

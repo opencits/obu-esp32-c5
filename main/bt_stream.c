@@ -40,7 +40,7 @@ extern int ble_hs_id_set_pub(const uint8_t *pub_addr);
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 
-static const char TAG[] = "BT_STREAM";
+static const char TAG[] = "ble";
 static const char DEVICE_NAME[] = "OBU-ESP32";
 
 #define FRAME_QUEUE_DEPTH      16
@@ -116,7 +116,9 @@ static int chr_access_cb(uint16_t conn_handle, uint16_t attr_handle,
     (void)conn_handle;
     (void)attr_handle;
     (void)arg;
+
     if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
+        ESP_LOGW(TAG, "READ op not permitted");
         return BLE_ATT_ERR_READ_NOT_PERMITTED;
     }
 
@@ -124,15 +126,18 @@ static int chr_access_cb(uint16_t conn_handle, uint16_t attr_handle,
      * hand off, the actual reassembly/dispatch happens on bt_reader_task. */
     uint16_t total = OS_MBUF_PKTLEN(ctxt->om);
     if (total == 0 || total > BT_RX_BUF_SIZE) {
+        ESP_LOGW(TAG, "Write len exceeded");
         return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
     }
 
     rxchunk_t *chunk = (rxchunk_t *)malloc(sizeof(rxchunk_t) + total);
     if (chunk == NULL) {
+        ESP_LOGW(TAG, "Write oom");
         return BLE_ATT_ERR_INSUFFICIENT_RES;
     }
     if (ble_hs_mbuf_to_flat(ctxt->om, chunk->data, total, NULL) != 0) {
         free(chunk);
+        ESP_LOGW(TAG, "Write error");
         return BLE_ATT_ERR_UNLIKELY;
     }
     chunk->len = total;
@@ -140,6 +145,9 @@ static int chr_access_cb(uint16_t conn_handle, uint16_t attr_handle,
     if (xQueueSend(s_rx_queue, &chunk, 0) != pdTRUE) {
         ESP_LOGW(TAG, "rx queue full, dropping write");
         free(chunk);
+    }
+    else {
+        ESP_LOGI(TAG, "Write %d bytes", chunk->len);
     }
     return 0;
 }

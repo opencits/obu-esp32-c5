@@ -223,42 +223,63 @@ static bool handle_config_command(char *line)
     return (err == ESP_OK);
 }
 
+static void on_ping(obu_comm_reply_fn reply, void *ctx)
+{
+    char buffer[1024];
+
+    wifi_stats_t stats;
+    wifi_get_stats(&stats);
+
+    int len = snprintf(buffer, 1024, "{\"txpower\":%d", wifi_get_txpower());
+    len += snprintf(buffer + len, 1024 - len, ",\"rx\":%lu", stats.rx);
+    len += snprintf(buffer + len, 1024 - len, ",\"rxErr\":%lu", stats.rxErr);
+    len += snprintf(buffer + len, 1024 - len, ",\"tx\":%lu", stats.tx);
+    len += snprintf(buffer + len, 1024 - len, ",\"txErr\":%lu", stats.txErr);
+    len += snprintf(buffer + len, 1024 - len, "}");
+
+    reply(COMM_FRAME_PONG, (const uint8_t*)buffer, len, ctx);
+}
+
+static void on_config(uint8_t *frame, uint16_t frame_len, obu_comm_reply_fn reply, void *ctx)
+{
+    char reply_buffer[1024];
+    size_t n = (frame_len < 1023) ? frame_len : 1023;
+    memcpy(reply_buffer, frame, n);
+    reply_buffer[n] = '\0';
+
+    if (handle_config_command(reply_buffer))
+    {
+        reply(COMM_FRAME_CMD_GOOD, NULL, 0, ctx);
+    }
+    else {
+        reply(COMM_FRAME_CMD_FAIL, NULL, 0, ctx);
+    }
+}
+
 void obu_comm_process_frame(uint16_t type, uint16_t length, uint8_t *payload,
                              obu_comm_reply_fn reply, void *ctx)
 {
-    uint16_t replyType = 0;
-
     switch (type) {
         case COMM_FRAME_PING:
-            replyType = COMM_FRAME_PONG;
+            on_ping(reply, ctx);
             break;
         case COMM_FRAME_PONG:
             ESP_LOGI(TAG, "Received PONG from host");
-            return;
+            break;
         case COMM_FRAME_CMD_REBOOT:
-            replyType = COMM_FRAME_CMD_GOOD;
-            reply(replyType, NULL, 0, ctx);
+            reply(COMM_FRAME_CMD_GOOD, NULL, 0, ctx);
             vTaskDelay(pdMS_TO_TICKS(150));
             esp_restart();
-            return;
-        case COMM_FRAME_CMD_CONFIG: {
-            /* payload is exactly `length` bytes with no guaranteed trailing
-             * NUL — copy into a bounded, NUL-terminated buffer before the
-             * string-based CFG:key=value parser runs (untrusted over BLE). */
-            char cmdbuf[300];
-            uint16_t n = (length < sizeof(cmdbuf) - 1) ? length : (uint16_t)(sizeof(cmdbuf) - 1);
-            memcpy(cmdbuf, payload, n);
-            cmdbuf[n] = '\0';
-            replyType = handle_config_command(cmdbuf) ? COMM_FRAME_CMD_GOOD : COMM_FRAME_CMD_FAIL;
             break;
-        }
+        case COMM_FRAME_CMD_CONFIG:
+            on_config(payload, length, reply, ctx);
+            break;
         case COMM_FRAME_TX:
             wifi_tx_frame(payload, length);
-            return;
+            break;
 
         default:
             ESP_LOGW(TAG, "Received unknown frame type: %d", type);
-            return;
+            break;
     }
-    reply(replyType, NULL, 0, ctx);
 }

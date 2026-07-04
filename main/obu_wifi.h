@@ -11,6 +11,13 @@ typedef struct {
   uint16_t length;
 } wifi_packet_t;
 
+typedef struct {
+  uint32_t rx;
+  uint32_t rxErr;
+  uint32_t tx;
+  uint32_t txErr;
+} wifi_stats_t;
+
 /**
  * @brief WLAN Sniffer Filter
  *
@@ -32,6 +39,8 @@ void wifi_autostart(void);
 int wifi_stop(void);
 
 void wifi_tx_frame(uint8_t *payload, uint16_t length);
+
+void wifi_get_stats(wifi_stats_t *stats);
 
 void wifi_set_channel(uint32_t channel);
 void wifi_set_filter(uint32_t filter);

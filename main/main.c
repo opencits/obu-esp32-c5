@@ -61,6 +61,22 @@ static void initialize_wifi(void)
     ESP_ERROR_CHECK(esp_wifi_start());
 }
 
+static void setup_wifi_power(void)
+{
+    int8_t tx_power;
+    esp_err_t ret = config_get_i8(CONFIG_INDEX_WIFI_TX_POWER, &tx_power);
+    if (ret == ESP_OK)
+    {
+        if (tx_power < 2 || tx_power > 20) {
+            ESP_LOGE(TAG, "TX power invalid: %d", tx_power);
+        }
+        else {
+            wifi_set_txpower(tx_power);
+        }
+    }
+    fprintf(stdout, "uOBU (%d dBm) version: %s\n", wifi_get_txpower(), COMM_VERSION);
+}
+
 static esp_console_repl_t *repl;
 static void console_init(void)
 {
@@ -202,4 +218,6 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_console_start_repl(repl));
 
     led_update();
+
+    setup_wifi_power();
 }

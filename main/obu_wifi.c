@@ -180,14 +180,6 @@ int wifi_start(void)
     // switch channel (channel, ignored, ignored, ht_mode?)
     phy_change_channel(channel, 1, 0, 0);
 
-    ret = esp_wifi_get_max_tx_power(&tx_power);
-    if (ret != ESP_OK) {
-        tx_power = -1;
-        ESP_LOGE(TAG, "Failed read TX power: %s", esp_err_to_name(ret));
-    }
-    else {
-        tx_power = tx_power / 4;
-    }
     ESP_LOGI(TAG, "start WiFi promiscuous ok");
     esp_event_post(WIFI_EVENT_BASE, WIFI_STARTED, NULL, 0, 0);
     return ret;
@@ -288,13 +280,17 @@ void wifi_set_filter(uint32_t filt) {
 }
 void wifi_set_txpower(int powerDbm) {
     int8_t power = powerDbm * 4;
-    if (power < 8 || power > 84) {
+    if (power < 8 || power > 80) {
         ESP_LOGE(TAG, "Invalid tx power value: %d (2..20)", powerDbm);
         return;
+    }
+    while (wifi_paused) {
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
     esp_err_t ret = esp_wifi_set_max_tx_power(power);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "esp_wifi_set_max_tx_power failed: %s", esp_err_to_name(ret));
+        tx_power = -1;
     }
     else {
         tx_power = power / 4;
@@ -308,6 +304,19 @@ uint32_t wifi_get_filter(void) {
     return filter;
 }
 int8_t wifi_get_txpower(void) {
+    if (tx_power < 0) {
+        while (wifi_paused) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        esp_err_t ret = esp_wifi_get_max_tx_power(&tx_power);
+        if (ret != ESP_OK) {
+            tx_power = -1;
+            ESP_LOGE(TAG, "Failed read TX power: %s", esp_err_to_name(ret));
+        }
+        else {
+            tx_power = tx_power / 4;
+        }
+    }
     return tx_power;
 }
 void wifi_set_datarate(int datarate) {

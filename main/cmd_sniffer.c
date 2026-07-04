@@ -36,8 +36,6 @@
 #define SNIFFER_MAX_ETH_INTFS               (3)
 #define SNIFFER_DECIMAL_NUM                 (10)
 
-static const char TAG[] = "SNIFFER";
-
 typedef struct {
     char *filter_name;
     uint32_t filter_val;
@@ -50,6 +48,8 @@ void sniffer_init(void) {
 static struct {
     struct arg_lit *fcsfail;
     struct arg_int *channel;
+    struct arg_int *power;
+    struct arg_lit *status;
     struct arg_lit *stop;
     struct arg_end *end;
 } sniffer_args;
@@ -70,6 +70,19 @@ static int do_sniffer_cmd(int argc, char **argv)
         return 0;
     }
 
+    if (sniffer_args.power->count) {
+        int tx_power = sniffer_args.power->ival[0];
+        wifi_set_txpower(tx_power);
+        return 0;
+    }
+
+    if (sniffer_args.status->count) {
+        int tx_power = wifi_get_txpower();
+        int channel = wifi_get_channel();
+        fprintf(stdout, "tx power %d dBm, frequency %d MHz\n", tx_power, channel);
+        return 0;
+    }
+
     uint32_t channel = SNIFFER_DEFAULT_CHANNEL;
     if (sniffer_args.channel->count) {
         channel = sniffer_args.channel->ival[0];
@@ -82,20 +95,9 @@ static int do_sniffer_cmd(int argc, char **argv)
     }
     wifi_set_filter(filter);
 
+
     /* start sniffer */
     wifi_start();
-
-    int8_t tx_power;
-    esp_err_t ret = config_get_i8(CONFIG_INDEX_WIFI_TX_POWER, &tx_power);
-    if (ret == ESP_OK)
-    {
-        if (tx_power < 2 || tx_power > 20) {
-            ESP_LOGE(TAG, "TX power invalid: %d", tx_power);
-        }
-        else {
-            wifi_set_txpower(tx_power);
-        }
-    }
     return 0;
 }
 
@@ -103,8 +105,11 @@ void register_sniffer_cmd(void)
 {
     sniffer_args.fcsfail = arg_lit0("F", "fcsfail", "include corrupted packets with wrong FCS");
     sniffer_args.channel = arg_int0("c", "channel", "<channel freq>", "frequency of communication channel to use (G5CC = 5900, G5SC2 = 5890, G5SC1 = 5880, G5SC3 = 5870, G5SC4 = 5860)");
+    sniffer_args.power = arg_int0("p", "power", "<tx power>", "transmit power in dBm (2..20)");
+    sniffer_args.status = arg_lit0(NULL, "status", "show sniffer status");
     sniffer_args.stop = arg_lit0(NULL, "stop", "stop running sniffer");
     sniffer_args.end = arg_end(1);
+
     const esp_console_cmd_t sniffer_cmd = {
         .command = "sniffer",
         .help = "Capture specific packet",

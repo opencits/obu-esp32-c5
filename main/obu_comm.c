@@ -235,6 +235,7 @@ static void on_ping(obu_comm_reply_fn reply, void *ctx)
     len += snprintf(buffer + len, 1024 - len, ",\"rxErr\":%lu", stats.rxErr);
     len += snprintf(buffer + len, 1024 - len, ",\"tx\":%lu", stats.tx);
     len += snprintf(buffer + len, 1024 - len, ",\"txErr\":%lu", stats.txErr);
+    len += snprintf(buffer + len, 1024 - len, ",\"version\":\"%s\"", COMM_VERSION);
     len += snprintf(buffer + len, 1024 - len, "}");
 
     reply(COMM_FRAME_PONG, (const uint8_t*)buffer, len, ctx);

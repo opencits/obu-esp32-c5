@@ -3,6 +3,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define COMM_VERSION "0.4"
+
 #define COMM_MAGIC 0x7384
 
 #define COMM_FRAME_PING 1

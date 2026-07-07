@@ -15,6 +15,9 @@
 
 static const char TAG[] = "OBU_COMM";
 
+static bool BLE_connected = false;
+static bool USB_connected = false;
+
 void obu_comm_reassembler_init(obu_comm_reassembler_t *r, uint8_t *buf, size_t buf_size)
 {
     r->buf = buf;
@@ -257,6 +260,48 @@ static void on_config(uint8_t *frame, uint16_t frame_len, obu_comm_reply_fn repl
     }
 }
 
+static void on_start(uint8_t *frame, uint16_t frame_len, obu_comm_reply_fn reply, void *ctx)
+{
+    if (frame_len != 3) {
+        ESP_LOGW(TAG, "Invalid START frame length: %d", frame_len);
+        reply(COMM_FRAME_CMD_FAIL, NULL, 0, ctx);
+        return;
+    }
+    if (frame[0] == 'U' && frame[1] == 'S' && frame[2] == 'B') {
+        USB_connected = true;
+        reply(COMM_FRAME_CMD_GOOD, NULL, 0, ctx);
+        return;
+    }
+    else if (frame[0] == 'B' && frame[1] == 'L' && frame[2] == 'E') {
+        BLE_connected = true;
+        reply(COMM_FRAME_CMD_GOOD, NULL, 0, ctx);
+        return;
+    }
+    ESP_LOGW(TAG, "Unrecognized START: %02x-%02x-%02x", frame[0], frame[1], frame[2]);
+    reply(COMM_FRAME_CMD_FAIL, NULL, 0, ctx);
+}
+
+static void on_stop(uint8_t *frame, uint16_t frame_len, obu_comm_reply_fn reply, void *ctx)
+{
+    if (frame_len != 3) {
+        ESP_LOGW(TAG, "Invalid STOP frame length: %d", frame_len);
+        reply(COMM_FRAME_CMD_FAIL, NULL, 0, ctx);
+        return;
+    }
+    if (frame[0] == 'U' && frame[1] == 'S' && frame[2] == 'B') {
+        USB_connected = false;
+        reply(COMM_FRAME_CMD_GOOD, NULL, 0, ctx);
+        return;
+    }
+    else if (frame[0] == 'B' && frame[1] == 'L' && frame[2] == 'E') {
+        BLE_connected = false;
+        reply(COMM_FRAME_CMD_GOOD, NULL, 0, ctx);
+        return;
+    }
+    ESP_LOGW(TAG, "Unrecognized STOP: %02x-%02x-%02x", frame[0], frame[1], frame[2]);
+    reply(COMM_FRAME_CMD_FAIL, NULL, 0, ctx);
+}
+
 void obu_comm_process_frame(uint16_t type, uint16_t length, uint8_t *payload,
                              obu_comm_reply_fn reply, void *ctx)
 {
@@ -272,6 +317,14 @@ void obu_comm_process_frame(uint16_t type, uint16_t length, uint8_t *payload,
             vTaskDelay(pdMS_TO_TICKS(150));
             esp_restart();
             break;
+        
+        case COMM_FRAME_CMD_START:
+            on_start(payload, length, reply, ctx);
+            break;
+        case COMM_FRAME_CMD_STOP:
+            on_stop(payload, length, reply, ctx);
+            break;
+        
         case COMM_FRAME_CMD_CONFIG:
             on_config(payload, length, reply, ctx);
             break;
@@ -283,4 +336,14 @@ void obu_comm_process_frame(uint16_t type, uint16_t length, uint8_t *payload,
             ESP_LOGW(TAG, "Received unknown frame type: %d", type);
             break;
     }
+}
+
+bool obu_comm_ble_connected(void)
+{
+    return BLE_connected;
+}
+
+bool obu_comm_usb_connected(void)
+{
+    return USB_connected;
 }

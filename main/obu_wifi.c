@@ -114,8 +114,10 @@ static void wifi_task(void *)
             continue;
         }
         wifi_stats.rx++;
-        usb_stream_publish_packet(&packet);
-        bt_stream_publish_packet(&packet);
+        
+        if (obu_comm_usb_connected()) usb_stream_publish_packet(&packet);
+        if (obu_comm_ble_connected()) bt_stream_publish_packet(&packet);
+        
         esp_event_post(WIFI_EVENT_BASE, WIFI_RECEIVED_PACKET, NULL, 0, 0);
         ESP_LOGD(TAG, "RX: %d bytes", packet.length);
         free(packet.payload);

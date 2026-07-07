@@ -12,6 +12,8 @@
 
 #define COMM_FRAME_CMD_REBOOT 20
 #define COMM_FRAME_CMD_CONFIG 21
+#define COMM_FRAME_CMD_START  22
+#define COMM_FRAME_CMD_STOP   23
 
 #define COMM_FRAME_CMD_GOOD 28
 #define COMM_FRAME_CMD_FAIL 29
@@ -79,3 +81,5 @@ typedef void (*obu_comm_reply_fn)(uint16_t type, const uint8_t *payload, uint16_
 void obu_comm_process_frame(uint16_t type, uint16_t length, uint8_t *payload,
                              obu_comm_reply_fn reply, void *ctx);
 
+bool obu_comm_ble_connected(void);
+bool obu_comm_usb_connected(void);

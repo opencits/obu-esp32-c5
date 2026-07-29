@@ -63,7 +63,7 @@ void usb_stream_publish_packet(const wifi_packet_t *pkt)
     usb_serial_jtag_write_bytes(&hdr, sizeof(hdr), pdMS_TO_TICKS(50));
     usb_serial_jtag_write_bytes(pkt->payload, pkt->length, pdMS_TO_TICKS(50));
 
-    led_pulse_usb_tx();
+    led_pulse_usb();
 }
 
 void usb_stream_send_ping(void)

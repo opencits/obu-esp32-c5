@@ -34,6 +34,8 @@
 #define WIFI_RX_FCS_ERR                  (0X41)
 #define WIFI_MAX_ETH_INTFS               (3)
 #define WIFI_DECIMAL_NUM                 (10)
+/* fixed 802.11 hw channel the radio is tuned to; 802.11p freq is set separately via phy_change_channel() */
+#define WIFI_HW_CHANNEL                  (140)
 
 static const char TAG[] = "wifi";
 
@@ -45,6 +47,7 @@ static uint32_t filter;
 static bool wifi_paused;
 static int tx_datarate;
 static int8_t tx_power = -1;
+static bool tx_loopback = false;
 
 static wifi_stats_t wifi_stats;
 
@@ -104,6 +107,25 @@ static void wifi_receive_cb(void *recv_buf, wifi_promiscuous_pkt_type_t type)
     }
 }
 
+static void wifi_loopback(uint8_t* payload,
+                        uint16_t payloadLen,
+                        uint8_t chan,
+                        uint8_t rate) {
+    struct timespec tp;
+    clock_gettime(CLOCK_REALTIME, &tp);
+
+    CommFrameHeader packet_info;
+    packet_info.seconds = htonl(tp.tv_sec);
+    packet_info.microseconds = htonl(tp.tv_nsec / 1000);
+    packet_info.channel = chan;
+    packet_info.rate = rate;
+    packet_info.rssi_power = 0;
+    packet_info.noise = 0;
+    packet_info.frameLen = htons(payloadLen);
+
+    queue_packet(payload, payloadLen, &packet_info);
+}
+
 static void wifi_task(void *)
 {
     wifi_packet_t packet;
@@ -119,7 +141,7 @@ static void wifi_task(void *)
         if (obu_comm_ble_connected()) bt_stream_publish_packet(&packet);
         
         esp_event_post(WIFI_EVENT_BASE, WIFI_RECEIVED_PACKET, NULL, 0, 0);
-        ESP_LOGD(TAG, "RX: %d bytes", packet.length);
+        ESP_LOGI(TAG, "RX: %d bytes", packet.length);
         free(packet.payload);
     }
     /* notify that sniffer task is over */
@@ -178,9 +200,14 @@ int wifi_start(void)
     // enable 802.11p mode (enable, unknown (must be 0))
     phy_11p_set(1, 0);
     // set a channel with a frequency close to our desired frequency (not sure if strictly needed)
-    ESP_GOTO_ON_ERROR(esp_wifi_set_channel(140, WIFI_SECOND_CHAN_NONE), err_start, TAG, "set channel failed");
+    ESP_GOTO_ON_ERROR(esp_wifi_set_channel(WIFI_HW_CHANNEL, WIFI_SECOND_CHAN_NONE), err_start, TAG, "set channel failed");
     // switch channel (channel, ignored, ignored, ht_mode?)
     phy_change_channel(channel, 1, 0, 0);
+
+    uint8_t loop;
+    if (config_get_u8(CONFIG_INDEX_WIFI_LOOP, &loop) == ESP_OK) {
+        tx_loopback = (loop != 0);
+    }
 
     ESP_LOGI(TAG, "start WiFi promiscuous ok");
     esp_event_post(WIFI_EVENT_BASE, WIFI_STARTED, NULL, 0, 0);
@@ -239,7 +266,7 @@ void wifi_resume(void)
   esp_wifi_set_promiscuous_filter(&wifi_filter);
   esp_wifi_set_promiscuous(true);
   phy_11p_set(1, 0);
-  esp_wifi_set_channel(140, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_channel(WIFI_HW_CHANNEL, WIFI_SECOND_CHAN_NONE);
   phy_change_channel(channel, 1, 0, 0);
   wifi_paused = false;
 }
@@ -324,6 +351,10 @@ int8_t wifi_get_txpower(void) {
 void wifi_set_datarate(int datarate) {
     tx_datarate = datarate;
 }
+void wifi_set_loop(uint8_t onOff) {
+    tx_loopback = (onOff != 0);
+}
+
 
 // ================================ TRANSMITTER =============================
 
@@ -423,66 +454,61 @@ esp_err_t esp_wifi_80211_tx_custom(wifi_interface_t ifx,
     wifi_band_t band,
     wifi_bandwidth_t bw)
 {
-    esp_err_t result = 0;//ieee80211_raw_frame_sanity_check(ifx, buffer, len, en_sys_seq);
-
-    if (!result)
+    int result = ESP_OK;
+    g_osi_funcs_p->_mutex_lock(g_wifi_global_lock);
+    x_ebuf_t* eb = ic_ebuf_alloc(buffer, 1, len);
+    if (eb)
     {
-        g_osi_funcs_p->_mutex_lock(g_wifi_global_lock);
-        x_ebuf_t* eb = ic_ebuf_alloc(buffer, 1, len);
+        //eb->data_length = len - 0x1a;
+        eb->data_length = 0;
+        x_eb_txdesc_t *txdesc_1 = eb->txdesc;
+        //eb->header_length = 0x1a;
+        eb->header_length = len;
+        txdesc_1->flags |= 0x4000;
+        txdesc_1->sched = ic_get_default_sched();
+        wifi_phy_rate_t rate = tx_rate_config->rate;
+        x_eb_txdesc_t *txdesc = eb->txdesc;
 
-        if (eb)
-        {
-            //eb->data_length = len - 0x1a;
-            eb->data_length = 0;
-            x_eb_txdesc_t *txdesc_1 = eb->txdesc;
-            //eb->header_length = 0x1a;
-            eb->header_length = len;
-            txdesc_1->flags |= 0x4000;
-            txdesc_1->sched = ic_get_default_sched();
-            wifi_phy_rate_t rate = tx_rate_config->rate;
-            x_eb_txdesc_t *txdesc = eb->txdesc;
-
-            if (rate)
-                txdesc->rate = (char)rate;
-            else if (band != WIFI_BAND_5G)
-                txdesc->rate = 0;
-            else
-                txdesc->rate = (char)WIFI_PHY_RATE_6M;
-
-            wifi_phy_mode_t phymode = tx_rate_config->phymode;
-
-            if (phymode == WIFI_PHY_MODE_HE20)
-            {
-                txdesc->flags |= 0x80000000;
-                txdesc->field_2f =
-                    (char)((((uint32_t)tx_rate_config->ersu + 6) & 0xf) << 3)
-                    | (txdesc->field_2f & 0x87);
-
-                if ((uint32_t)tx_rate_config->dcm)
-                    txdesc->field_31 |= 0x80;
-            }
-            else if (phymode == WIFI_PHY_MODE_VHT20)
-                txdesc->flags |= 0x1000000;
-
-            // No idea if this is correct, but this is what the original code does...
-            uint32_t bw_is_bw40 = bw == WIFI_BW40;
-            txdesc->field_8 = (bw_is_bw40 << 0xf) | (txdesc->field_8 & 0xffff7fff);
-
-            if (en_sys_seq)
-                txdesc->flags |= 1;
-
-            txdesc->field_10 =
-                (txdesc->field_10 & 0xfff3ffff) | ((ifx & WIFI_IF_MAX) << 0x12);
-            txdesc->field_14 = 0x100;
-
-            ieee80211_post_hmac_tx(eb);
-            g_osi_funcs_p->_mutex_unlock(g_wifi_global_lock);
-        }
+        if (rate)
+            txdesc->rate = (char)rate;
+        else if (band != WIFI_BAND_5G)
+            txdesc->rate = 0;
         else
+            txdesc->rate = (char)WIFI_PHY_RATE_6M;
+
+        wifi_phy_mode_t phymode = tx_rate_config->phymode;
+
+        if (phymode == WIFI_PHY_MODE_HE20)
         {
-            result = ESP_ERR_NO_MEM;
-            g_osi_funcs_p->_mutex_unlock(g_wifi_global_lock);
+            txdesc->flags |= 0x80000000;
+            txdesc->field_2f =
+                (char)((((uint32_t)tx_rate_config->ersu + 6) & 0xf) << 3)
+                | (txdesc->field_2f & 0x87);
+
+            if ((uint32_t)tx_rate_config->dcm)
+                txdesc->field_31 |= 0x80;
         }
+        else if (phymode == WIFI_PHY_MODE_VHT20)
+            txdesc->flags |= 0x1000000;
+
+        // No idea if this is correct, but this is what the original code does...
+        uint32_t bw_is_bw40 = bw == WIFI_BW40;
+        txdesc->field_8 = (bw_is_bw40 << 0xf) | (txdesc->field_8 & 0xffff7fff);
+
+        if (en_sys_seq)
+            txdesc->flags |= 1;
+
+        txdesc->field_10 =
+            (txdesc->field_10 & 0xfff3ffff) | ((ifx & WIFI_IF_MAX) << 0x12);
+        txdesc->field_14 = 0x100;
+
+        ieee80211_post_hmac_tx(eb);
+        g_osi_funcs_p->_mutex_unlock(g_wifi_global_lock);
+    }
+    else
+    {
+        result = ESP_ERR_NO_MEM;
+        g_osi_funcs_p->_mutex_unlock(g_wifi_global_lock);
     }
     return result;
 }
@@ -563,5 +589,8 @@ void wifi_tx_frame(uint8_t *payload, uint16_t length)
         wifi_stats.tx++;
         esp_event_post(WIFI_EVENT_BASE, WIFI_TRANSMIT_PACKET, NULL, 0, 0);
         ESP_LOGD(TAG, "TX: %d bytes", length);
+        if (tx_loopback) {
+            wifi_loopback(payload, length, hdr->channel, hdr->rate);
+        }
     }
 }

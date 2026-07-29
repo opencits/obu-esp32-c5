@@ -468,7 +468,7 @@ static void bt_writer_task(void *arg)
                  * but there is no public API to free it explicitly here. */
                 break;
             }
-            led_pulse_ble_tx();
+            led_pulse_ble();
             sent += n;
         }
         free(qf);

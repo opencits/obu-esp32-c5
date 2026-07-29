@@ -56,7 +56,8 @@ static esp_err_t config_get_node_id(char *out, size_t *size);
 static esp_err_t config_get_autostart_chan(uint32_t *autostart_chan);
 static esp_err_t config_get_led_brightness(uint8_t *led_brightness);
 
-static esp_err_t config_set_tx_power(int8_t *tx_power);
+static esp_err_t config_set_tx_power(int8_t tx_power);
+static esp_err_t config_set_loop(uint8_t loop);
 
 static const config_key_t config_keys[] = {
     [CONFIG_INDEX_NODEID]         = { "nodeid",           NVS_TYPE_STR, CONFIG_NODEID_BUFFER_SIZE,   config_get_node_id,        NULL },
@@ -82,6 +83,7 @@ static const config_key_t config_keys[] = {
     [CONFIG_INDEX_SNIFF_MS]      = { "sniffms",    NVS_TYPE_U32, 0,                            NULL, NULL },
     [CONFIG_INDEX_WIFI_MS]       = { "wifims",     NVS_TYPE_U32, 0,                            NULL, NULL },
     [CONFIG_INDEX_WIFI_TX_POWER] = { "txpower",    NVS_TYPE_I8,  0,                            NULL, config_set_tx_power },
+    [CONFIG_INDEX_WIFI_LOOP]     = { "loop",       NVS_TYPE_U8,  0,                            NULL, config_set_loop },
 };
 #define CONFIG_KEYS_END (&config_keys[sizeof(config_keys)/sizeof(*config_keys)])
 
@@ -94,7 +96,6 @@ void config_init(void)
         err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(err);
-
     ESP_ERROR_CHECK(nvs_open("its", NVS_READWRITE, &handle));
 }
 
@@ -131,9 +132,7 @@ static esp_err_t config_get_node_id(char *out, size_t *size)
 
         size_copy = print_res + 1;
     }
-
     *size = size_copy;
-
     return ESP_OK;
 }
 
@@ -145,7 +144,6 @@ static esp_err_t config_get_autostart_chan(uint32_t *autostart_chan)
     {
         if (res != ESP_ERR_NVS_NOT_FOUND)
             ESP_LOGE(TAG, "nvs_get_u32 failed: %s", esp_err_to_name(res));
-
         out = 5900;
     }
 
@@ -161,23 +159,27 @@ static esp_err_t config_get_led_brightness(uint8_t *led_brightness)
     {
         if (res != ESP_ERR_NVS_NOT_FOUND)
             ESP_LOGE(TAG, "nvs_get_u8 failed: %s", esp_err_to_name(res));
-
         out = 255;
     }
-
     *led_brightness = out;
     return ESP_OK;
 }
 
-static esp_err_t config_set_tx_power(int8_t *tx_power)
+static esp_err_t config_set_tx_power(int8_t tx_power)
 {
-    if (*tx_power < 2 || *tx_power > 20)
+    if (tx_power < 2 || tx_power > 20)
     {
-        ESP_LOGE(TAG, "Invalid tx power value: %d", *tx_power);
+        ESP_LOGE(TAG, "Invalid tx power value: %d", tx_power);
         return ESP_ERR_INVALID_ARG;
     }
-    wifi_set_txpower(*tx_power * 4);
-    return config_set_i8(CONFIG_INDEX_WIFI_TX_POWER, *tx_power);
+    wifi_set_txpower(tx_power * 4);
+    return nvs_set_i8(handle, config_keys[CONFIG_INDEX_WIFI_TX_POWER].name, tx_power);
+}
+
+static esp_err_t config_set_loop(uint8_t loop)
+{
+    wifi_set_loop(loop);
+    return nvs_set_u8(handle, config_keys[CONFIG_INDEX_WIFI_LOOP].name, loop);
 }
 
 esp_err_t config_get_u8(config_index_t index, uint8_t *out)
@@ -370,7 +372,7 @@ esp_err_t config_set_i8(config_index_t index, int8_t value)
 
     if (key->type != NVS_TYPE_I8)
     {
-        ESP_LOGE(TAG, "Attempt to set key %s with wrong type i8", key->name);
+        ESP_LOGE(TAG, "Attempt to set key %s with wrong type i8(%u)", key->name, index);
         return ESP_ERR_INVALID_ARG;
     }
 

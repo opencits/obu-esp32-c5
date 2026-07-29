@@ -172,7 +172,6 @@ static int cfg_key_to_index(const char *key)
 {
     /* string keys */
     if (!strcmp(key, "nodeid"))    return CONFIG_INDEX_NODEID;
-    if (!strcmp(key, "mqtturi"))   return CONFIG_INDEX_MQTT_URI;
     if (!strcmp(key, "wifi1ssid")) return CONFIG_INDEX_WIFI1_SSID;
     if (!strcmp(key, "wifi1pass")) return CONFIG_INDEX_WIFI1_PASS;
     if (!strcmp(key, "wifi2ssid")) return CONFIG_INDEX_WIFI2_SSID;
@@ -185,45 +184,29 @@ static int cfg_key_to_index(const char *key)
     if (!strcmp(key, "wifiopen"))  return CONFIG_INDEX_WIFI_OPEN;
     if (!strcmp(key, "connmode"))  return CONFIG_INDEX_CONN_MODE;
     if (!strcmp(key, "sniffmode")) return CONFIG_INDEX_SNIFF_MODE;
+    if (!strcmp(key, "led"))       return CONFIG_INDEX_LED_BRIGHTNESS;
+    if (!strcmp(key, "channel"))   return CONFIG_INDEX_AUTOSTART_CHAN;
     /* u32 keys */
     if (!strcmp(key, "sniffms"))   return CONFIG_INDEX_SNIFF_MS;
     if (!strcmp(key, "wifims"))    return CONFIG_INDEX_WIFI_MS;
+    if (!strcmp(key, "txpower"))   return CONFIG_INDEX_WIFI_TX_POWER;
+    if (!strcmp(key, "loop"))      return CONFIG_INDEX_WIFI_LOOP;
+
     return -1;
 }
 
 static bool is_u8_key(const char *key)
 {
-    return !strcmp(key,"wifiopen") || !strcmp(key,"connmode") || !strcmp(key,"sniffmode");
+    return !strcmp(key,"wifiopen") || !strcmp(key,"connmode") || !strcmp(key,"sniffmode") ||
+           !strcmp(key,"led") || !strcmp(key,"loop");
 }
 static bool is_u32_key(const char *key)
 {
-    return !strcmp(key,"sniffms") || !strcmp(key,"wifims");
+    return !strcmp(key,"sniffms") || !strcmp(key,"wifims") || !strcmp(key,"channel");
 }
-
-static bool handle_config_command(char *line)
+static bool is_i8_key(const char *key)
 {
-    /* Expect "CFG:key=value" */
-    if (strncmp(line, "CFG:", 4) != 0) return false;
-    char *kv = line + 4;
-    char *eq = strchr(kv, '=');
-    if (!eq) { ESP_LOGW(TAG, "CFG: no equals in '%s'", line); return false; }
-    *eq = '\0';
-    char *key = kv, *val = eq + 1;
-
-    int idx = cfg_key_to_index(key);
-    if (idx < 0) { ESP_LOGW(TAG, "CFG: unknown key '%s'", key); return false; }
-
-    esp_err_t err;
-    if (is_u8_key(key)) {
-        uint8_t v = (uint8_t)atoi(val);
-        err = config_set_u8((config_index_t)idx, v);
-    } else if (is_u32_key(key)) {
-        uint32_t v = (uint32_t)atol(val);
-        err = config_set_u32((config_index_t)idx, v);
-    } else {
-        err = config_set_str((config_index_t)idx, val);
-    }
-    return (err == ESP_OK);
+    return !strcmp(key,"txpower");
 }
 
 static void on_ping(obu_comm_reply_fn reply, void *ctx)
@@ -233,8 +216,7 @@ static void on_ping(obu_comm_reply_fn reply, void *ctx)
     wifi_stats_t stats;
     wifi_get_stats(&stats);
 
-    int len = snprintf(buffer, 1024, "{\"txpower\":%d", wifi_get_txpower());
-    len += snprintf(buffer + len, 1024 - len, ",\"rx\":%lu", stats.rx);
+    int len = snprintf(buffer, 1024, "{\"rx\":%lu", stats.rx);
     len += snprintf(buffer + len, 1024 - len, ",\"rxErr\":%lu", stats.rxErr);
     len += snprintf(buffer + len, 1024 - len, ",\"tx\":%lu", stats.tx);
     len += snprintf(buffer + len, 1024 - len, ",\"txErr\":%lu", stats.txErr);
@@ -246,17 +228,79 @@ static void on_ping(obu_comm_reply_fn reply, void *ctx)
 
 static void on_config(uint8_t *frame, uint16_t frame_len, obu_comm_reply_fn reply, void *ctx)
 {
-    char reply_buffer[1024];
+    char line[1024];
     size_t n = (frame_len < 1023) ? frame_len : 1023;
-    memcpy(reply_buffer, frame, n);
-    reply_buffer[n] = '\0';
+    memcpy(line, frame, n);
+    line[n] = '\0';
 
-    if (handle_config_command(reply_buffer))
-    {
-        reply(COMM_FRAME_CMD_GOOD, NULL, 0, ctx);
-    }
-    else {
+    esp_err_t err;
+    /* Expect "CFG:key=value" */
+    if (strncmp(line, "CFG:", 4) != 0) {
+        ESP_LOGW(TAG, "CFG: no header '%s'", line);
         reply(COMM_FRAME_CMD_FAIL, NULL, 0, ctx);
+        return;
+    }
+
+    char *kv = line + 4;
+    char *eq = strchr(kv, '=');
+    if (eq)
+    {
+        // WRITE - command
+        *eq = '\0';
+        char *key = kv, *val = eq + 1;
+
+        int idx = cfg_key_to_index(key);
+        if (idx < 0) {
+            ESP_LOGW(TAG, "CFG: unknown key '%s'", key);
+            reply(COMM_FRAME_CMD_FAIL, NULL, 0, ctx);
+            return;
+        }
+
+        if (is_u8_key(key)) {
+            uint8_t v = (uint8_t)atoi(val);
+            err = config_set_u8((config_index_t)idx, v);
+        } else if (is_u32_key(key)) {
+            uint32_t v = (uint32_t)atol(val);
+            err = config_set_u32((config_index_t)idx, v);
+        } else if (is_i8_key(key)) {
+            int8_t v = (int8_t)atoi(val);
+            err = config_set_i8((config_index_t)idx, v);
+        } else {
+            err = config_set_str((config_index_t)idx, val);
+        }
+        if (err != ESP_OK) {
+            reply(COMM_FRAME_CMD_FAIL, NULL, 0, ctx);
+            return;
+        }
+    }
+    // READ - command
+    int idx = cfg_key_to_index(kv);
+    if (idx < 0) {
+        ESP_LOGW(TAG, "CFG: unknown key '%s'", kv);
+        reply(COMM_FRAME_CMD_FAIL, NULL, 0, ctx);
+        return;
+    }
+    size_t len = 0;
+    if (is_u8_key(kv)) {
+        uint8_t v;
+        err = config_get_u8((config_index_t)idx, &v);
+        len = snprintf(line, 1023, "%u", v);
+    } else if (is_i8_key(kv)) {
+        int8_t v;
+        err = config_get_i8((config_index_t)idx, &v);
+        len = snprintf(line, 1023, "%d", v);
+    } else if (is_u32_key(kv)) {
+        uint32_t v;
+        err = config_get_u32((config_index_t)idx, &v);
+        len = snprintf(line, 1023, "%lu", v);
+    } else {
+        len = 1023;
+        err = config_get_str((config_index_t)idx, line, &len);
+    }
+    if (err == ESP_OK) {
+        reply(COMM_FRAME_CMD_CONFIG, (const uint8_t*)line, len, ctx);
+    } else {
+        reply(COMM_FRAME_CMD_CONFIG, NULL, 0, ctx);
     }
 }
 

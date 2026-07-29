@@ -111,7 +111,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         {
             esp_timer_start_once(cits_led_timer_handle, 50000);
         }
-        led_pulse_wifi_rx();
+        led_pulse_wifi();
         break;
     case WIFI_TRANSMIT_PACKET:
         set_cits_led_active();
@@ -119,7 +119,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         {
             esp_timer_start_once(cits_led_timer_handle, 50000);
         }
-        led_pulse_wifi_tx();
+        led_pulse_wifi();
         break;
     case WIFI_STARTED:
         set_wifi_led_running();
@@ -190,10 +190,9 @@ static void led_pulse(uint8_t r, uint8_t g, uint8_t b, int ms)
     }
 }
 
-void led_pulse_wifi_rx(void)    { led_pulse(0x00, 0xFF, 0x00, 80); }
-void led_pulse_wifi_tx(void)    { led_pulse(0xFF, 0x00, 0x00, 80); }
-void led_pulse_ble_tx(void)     { led_pulse(0x00, 0x00, 0xFF, 60); }
-void led_pulse_usb_tx(void)     { led_pulse(0x00, 0xFF, 0xFF, 40); }
+void led_pulse_wifi(void)    { led_pulse(0xFF, 0x00, 0x00, 40); }
+void led_pulse_ble(void)     { led_pulse(0x00, 0x00, 0xFF, 60); }
+void led_pulse_usb(void)     { led_pulse(0x00, 0xFF, 0x00, 40); }
 
 void led_status_ble_connected(bool c)
 {
@@ -281,12 +280,6 @@ void led_init(void)
     ESP_ERROR_CHECK(config_get_u8(CONFIG_INDEX_LED_BRIGHTNESS, &brightness));
     led_brightness = brightness;
 
-    set_led_with_brightness(led_handle, LED_IRGB(0, 0xFF,    0,    0));
-    set_led_with_brightness(led_handle, LED_IRGB(1, 0xFF, 0xFF,    0));
-    set_led_with_brightness(led_handle, LED_IRGB(2,    0, 0xFF,    0));
-    set_led_with_brightness(led_handle, LED_IRGB(3,    0,    0, 0xFF));
-    set_led_with_brightness(led_handle, LED_IRGB(4, 0xFF,    0, 0xFF));
-
     /* Boot self-test on LED 0 so a missing onboard WS2812 / wrong GPIO is
      * obvious at first glance: bright R → G → B → W, ~150 ms each. */
     set_led_with_brightness(led_handle, LED_IRGB(LED_SYSTEM, 0xFF, 0x00, 0x00));
@@ -297,4 +290,5 @@ void led_init(void)
     vTaskDelay(pdMS_TO_TICKS(150));
     set_led_with_brightness(led_handle, LED_IRGB(LED_SYSTEM, 0xFF, 0xFF, 0xFF));
     vTaskDelay(pdMS_TO_TICKS(150));
+    set_led_with_brightness(led_handle, LED_IRGB(LED_SYSTEM, 0x00, 0x00, 0x00));
 }

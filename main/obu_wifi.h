@@ -46,6 +46,7 @@ void wifi_set_channel(uint32_t channel);
 void wifi_set_filter(uint32_t filter);
 void wifi_set_txpower(int powerDbm);
 void wifi_set_datarate(int datarate);
+void wifi_set_loop(uint8_t onOff);
 
 uint32_t wifi_get_channel(void);
 uint32_t wifi_get_filter(void);

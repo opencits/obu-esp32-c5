@@ -3,7 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define COMM_VERSION "0.4"
+#define COMM_VERSION "0.5"
 
 #define COMM_MAGIC 0x7384
 
@@ -37,8 +37,8 @@ typedef struct
 } __packed CommHeader;
 
 typedef struct {
-  uint8_t channel;
-  uint8_t rate;
+  uint16_t channel;  // in MHz, zero is valid (default used)
+  uint16_t rate;     // in kbps, zero is valid (default used)
   int8_t rssi_power;
   int8_t noise;
   uint32_t seconds;

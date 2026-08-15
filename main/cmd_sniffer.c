@@ -29,7 +29,6 @@
 
 #include "cmd_sniffer.h"
 
-#define SNIFFER_DEFAULT_CHANNEL             (1)
 #define SNIFFER_PAYLOAD_FCS_LEN             (4)
 #define SNIFFER_PROCESS_PACKET_TIMEOUT_MS   (100)
 #define SNIFFER_RX_FCS_ERR                  (0X41)
@@ -76,18 +75,17 @@ static int do_sniffer_cmd(int argc, char **argv)
         return 0;
     }
 
-    if (sniffer_args.status->count) {
-        int tx_power = wifi_get_txpower();
-        int channel = wifi_get_channel();
-        fprintf(stdout, "tx power %d dBm, frequency %d MHz\n", tx_power, channel);
-        return 0;
-    }
-
-    uint32_t channel = SNIFFER_DEFAULT_CHANNEL;
+    uint32_t channel = wifi_get_channel();
     if (sniffer_args.channel->count) {
         channel = sniffer_args.channel->ival[0];
+        wifi_set_channel(channel);
     }
-    wifi_set_channel(channel);
+
+    if (sniffer_args.status->count) {
+        int tx_power = wifi_get_txpower();
+        fprintf(stdout, "tx power %d dBm, frequency %lu MHz\n", tx_power, channel);
+        return 0;
+    }
 
     uint32_t filter = WIFI_PROMIS_FILTER_MASK_ALL;
     if (!sniffer_args.fcsfail->count) {

@@ -28,7 +28,6 @@
 #include "usb_stream.h"
 #include "bt_stream.h"
 
-#define WIFI_DEFAULT_CHANNEL             (1)
 #define WIFI_PAYLOAD_FCS_LEN             (4)
 #define WIFI_PROCESS_PACKET_TIMEOUT_MS   (100)
 #define WIFI_RX_FCS_ERR                  (0X41)
@@ -42,10 +41,10 @@ static const char TAG[] = "wifi";
 static bool is_running;
 static bool coex_enabled;
 
-static uint32_t channel;
+static uint16_t channel;     // in MHZ : CCH
 static uint32_t filter;
 static bool wifi_paused;
-static int tx_datarate;
+static uint16_t tx_datarate = 6000; // in kbps: 6000
 static int8_t tx_power = -1;
 static bool tx_loopback = false;
 
@@ -59,26 +58,107 @@ static SemaphoreHandle_t sem_task_over;
 void phy_change_channel(int,int,int,int);
 void phy_11p_set(int,int);
 
-static void queue_packet(void *recv_packet, uint16_t len, const CommFrameHeader *packet_info)
+static int datarateKbpsToCode(uint16_t rate)
+{
+    switch (rate)
+    {
+    case 3000:
+        return WIFI_PHY_RATE_6M; // BPSK 1/2
+    case 4500:
+        return WIFI_PHY_RATE_9M; // BPSK 3/4
+    case 6000:
+        return WIFI_PHY_RATE_12M; // QPSK 1/2
+    case 9000:
+        return WIFI_PHY_RATE_18M; // QPSK 3/4
+    case 12000:
+        return WIFI_PHY_RATE_24M; // 16-QAM 1/2
+    case 18000:
+        return WIFI_PHY_RATE_36M; // 16-QAM 3/4
+    case 24000:
+        return WIFI_PHY_RATE_48M; // 64-QAM 1/2
+    case 27000:
+        return WIFI_PHY_RATE_54M; // 64-QAM 3/4
+
+    default:
+        break;
+    }
+    return WIFI_PHY_RATE_12M; // return default rate (6Mbps)
+}
+
+static uint16_t datarateCodeToKbps(int rate)
+{
+    switch (rate)
+    {
+    case WIFI_PHY_RATE_6M:
+        return 3000;
+    case WIFI_PHY_RATE_9M:
+        return 4500;
+    case WIFI_PHY_RATE_12M:
+        return 6000;
+    case WIFI_PHY_RATE_18M:
+        return 9000;
+    case WIFI_PHY_RATE_24M:
+        return 12000;
+    case WIFI_PHY_RATE_36M:
+        return 18000;
+    case WIFI_PHY_RATE_48M:
+        return 24000;
+    case WIFI_PHY_RATE_54M:
+        return 27000;
+    default:
+        break;
+    }
+    return 6000; // return default rate (6Mbps)
+}
+
+static bool check_valid_channel(uint16_t chan)
+{
+    switch (chan)
+    {
+    case 5860: // SCH4
+    case 5870: // SCH3
+    case 5880: // SCH1
+    case 5890: // SCH2
+    case 5900: // CCH, SCH0
+    case 5910: // SCH5
+    case 5920: // SCH6
+        return true;
+    default:
+        break;
+    }
+    return false;
+}
+
+static void queue_packet(const void *recv_packet, uint16_t len, const CommFrameHeader *packet_info)
 {
     wifi_packet_t packet;
     /* Copy a packet from Link Layer driver and queue the copy to be processed by sniffer task */
     packet.payload = malloc(sizeof(CommFrameHeader) + len);
-    packet.length = sizeof(CommFrameHeader) + len;
-    if (packet.payload) {
+    if (packet.payload)
+    {
+        packet.length = sizeof(CommFrameHeader) + len;
         memcpy(packet.payload, packet_info, sizeof(CommFrameHeader));
         memcpy(packet.payload + sizeof(CommFrameHeader), recv_packet, len);
-        if (work_queue) {
+        if (work_queue)
+        {
             /* send packet_info */
-            if (xQueueSend(work_queue, &packet, pdMS_TO_TICKS(WIFI_PROCESS_PACKET_TIMEOUT_MS)) != pdTRUE) {
-                wifi_stats.rxErr++;
-                ESP_LOGE(TAG, "sniffer work queue full");
-                free(packet.payload);
+            if (xQueueSend(work_queue, &packet, pdMS_TO_TICKS(WIFI_PROCESS_PACKET_TIMEOUT_MS)) == pdTRUE)
+            {
+                return;
             }
+            ESP_LOGE(TAG, "sniffer work queue full");
         }
-    } else {
+        else
+        {
+            ESP_LOGE(TAG, "sniffer work queue not initialized");
+        }
+        free(packet.payload);
+    }
+    else
+    {
         ESP_LOGE(TAG, "No enough memory for promiscuous packet");
     }
+    wifi_stats.rxErr++;
 }
 
 static void wifi_receive_cb(void *recv_buf, wifi_promiscuous_pkt_type_t type)
@@ -86,39 +166,44 @@ static void wifi_receive_cb(void *recv_buf, wifi_promiscuous_pkt_type_t type)
     CommFrameHeader packet_info;
     uint16_t payloadLen;
     wifi_promiscuous_pkt_t *packet = (wifi_promiscuous_pkt_t *)recv_buf;
+
     /* prepare packet_info */
     packet_info.seconds = htonl(packet->rx_ctrl.timestamp / 1000000U);
     packet_info.microseconds = htonl(packet->rx_ctrl.timestamp % 1000000U);
-    packet_info.channel = (uint8_t)packet->rx_ctrl.channel;
-    packet_info.rate = (uint8_t)packet->rx_ctrl.rate;
     packet_info.rssi_power = (int8_t)packet->rx_ctrl.rssi;
     packet_info.noise = (int8_t)packet->rx_ctrl.noise_floor;
 
-#if CONFIG_SOC_WIFI_HE_SUPPORT
-    payloadLen = packet->rx_ctrl.dump_len;
-#else
-    payloadLen = packet->rx_ctrl.sig_len - WIFI_PAYLOAD_FCS_LEN;
-#endif
+    // donot use the rx_ctrl channel
+    // this is the MAC channel used in wifi_resume,
+    // --> esp_wifi_set_channel(WIFI_HW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    // then overwritten by
+    // --> phy_change_channel(channel, 1, 0, 0);
+    packet_info.channel = htons(channel);
 
+    // convert to datarate in kbps
+    packet_info.rate = htons(datarateCodeToKbps(packet->rx_ctrl.rate));
+
+    payloadLen = packet->rx_ctrl.sig_len - WIFI_PAYLOAD_FCS_LEN;
     packet_info.frameLen = htons(payloadLen);
     /* For now, the sniffer only dumps the length of the MISC type frame */
-    if (type != WIFI_PKT_MISC && !packet->rx_ctrl.rx_state) {
+    if (type != WIFI_PKT_MISC && !packet->rx_ctrl.rx_state)
+    {
         queue_packet(packet->payload, payloadLen, &packet_info);
     }
 }
 
-static void wifi_loopback(uint8_t* payload,
+static void wifi_loopback(const uint8_t* payload,
                         uint16_t payloadLen,
-                        uint8_t chan,
-                        uint8_t rate) {
+                        uint16_t chan,
+                        uint16_t rate) {
     struct timespec tp;
     clock_gettime(CLOCK_REALTIME, &tp);
 
     CommFrameHeader packet_info;
     packet_info.seconds = htonl(tp.tv_sec);
     packet_info.microseconds = htonl(tp.tv_nsec / 1000);
-    packet_info.channel = chan;
-    packet_info.rate = rate;
+    packet_info.channel = htons(chan);
+    packet_info.rate = htons(rate);
     packet_info.rssi_power = 0;
     packet_info.noise = 0;
     packet_info.frameLen = htons(payloadLen);
@@ -129,10 +214,11 @@ static void wifi_loopback(uint8_t* payload,
 static void wifi_task(void *)
 {
     wifi_packet_t packet;
-
-    while (is_running) {
+    while (is_running)
+    {
         /* receive packet info from queue */
-        if (xQueueReceive(work_queue, &packet, pdMS_TO_TICKS(WIFI_PROCESS_PACKET_TIMEOUT_MS)) != pdTRUE) {
+        if (xQueueReceive(work_queue, &packet, pdMS_TO_TICKS(WIFI_PROCESS_PACKET_TIMEOUT_MS)) != pdTRUE)
+        {
             continue;
         }
         wifi_stats.rx++;
@@ -167,7 +253,8 @@ int wifi_stop(void)
     UBaseType_t left_items = uxQueueMessagesWaiting(work_queue);
 
     wifi_packet_t packet_info;
-    while (left_items--) {
+    while (left_items--)
+    {
         xQueueReceive(work_queue, &packet_info, pdMS_TO_TICKS(WIFI_PROCESS_PACKET_TIMEOUT_MS));
         free(packet_info.payload);
     }
@@ -226,21 +313,23 @@ err_start:
 
 void wifi_autostart(void)
 {
-  uint32_t conf_channel;
-  esp_err_t ret = config_get_u32(CONFIG_INDEX_AUTOSTART_CHAN, &conf_channel);
-  if (ret != ESP_OK)
-  {
-    if (ret != ESP_ERR_NVS_NOT_FOUND)
-      ESP_LOGE(TAG, "config_get_u32 failed: %s", ret);
-    return;
-  }
+    uint32_t conf_channel = 5900;
+    esp_err_t ret = config_get_u32(CONFIG_INDEX_AUTOSTART_CHAN, &conf_channel);
+    if (ret != ESP_OK)
+    {
+        if (ret != ESP_ERR_NVS_NOT_FOUND)
+        ESP_LOGE(TAG, "autostart: config_get_u32 failed: %s", ret);
+        return;
+    }
+    if (!check_valid_channel(conf_channel))
+    {
+        ESP_LOGE(TAG, "autostart: conf_channel invalid: %u", conf_channel);
+        return;
+    }
 
-  if (conf_channel >= 5800 && conf_channel <= 5900)
-  {
     channel = conf_channel;
     filter = WIFI_PROMIS_FILTER_MASK_ALL & ~WIFI_PROMIS_FILTER_MASK_FCSFAIL;
     wifi_start();
-  }
 }
 
 void wifi_pause(void)
@@ -285,7 +374,6 @@ void wifi_init(void)
 {
   esp_err_t ret = ESP_OK;
   coex_enabled = true;
-  tx_datarate = -1;
 
   sem_task_over = xSemaphoreCreateBinary();
   ESP_GOTO_ON_FALSE(sem_task_over, ESP_FAIL, err, TAG, "create semaphore failed");
@@ -297,61 +385,85 @@ void wifi_init(void)
       ESP_ERROR_CHECK(ret);
 }
 
-void wifi_get_stats(wifi_stats_t *stats) {
+void wifi_get_stats(wifi_stats_t *stats)
+{
     memcpy(stats, &wifi_stats, sizeof(wifi_stats_t));
 }
 
-void wifi_set_channel(uint32_t chan) {
+void wifi_set_channel(uint16_t chan)
+{
+    if (!check_valid_channel(chan))
+    {
+        ESP_LOGE(TAG, "Invalid channel value: %u", chan);
+        return;
+    }
     channel = chan;
 }
-void wifi_set_filter(uint32_t filt) {
+void wifi_set_filter(uint32_t filt)
+{
     filter = filt;
 }
-void wifi_set_txpower(int powerDbm) {
+void wifi_set_txpower(int powerDbm)
+{
     int8_t power = powerDbm * 4;
-    if (power < 8 || power > 80) {
+    if (power < 8 || power > 80)
+    {
         ESP_LOGE(TAG, "Invalid tx power value: %d (2..20)", powerDbm);
         return;
     }
-    while (wifi_paused) {
+    while (wifi_paused)
+    {
         vTaskDelay(pdMS_TO_TICKS(100));
     }
     esp_err_t ret = esp_wifi_set_max_tx_power(power);
-    if (ret != ESP_OK) {
+    if (ret != ESP_OK)
+    {
         ESP_LOGE(TAG, "esp_wifi_set_max_tx_power failed: %s", esp_err_to_name(ret));
         tx_power = -1;
     }
-    else {
+    else
+    {
         tx_power = power / 4;
     }
 }
 
-uint32_t wifi_get_channel(void) {
+uint32_t wifi_get_channel(void)
+{
     return channel;
 }
-uint32_t wifi_get_filter(void) {
+uint32_t wifi_get_filter(void)
+{
     return filter;
 }
-int8_t wifi_get_txpower(void) {
-    if (tx_power < 0) {
-        while (wifi_paused) {
+
+int8_t wifi_get_txpower(void)
+{
+    if (tx_power < 0)
+    {
+        while (wifi_paused)
+        {
             vTaskDelay(pdMS_TO_TICKS(100));
         }
         esp_err_t ret = esp_wifi_get_max_tx_power(&tx_power);
-        if (ret != ESP_OK) {
+        if (ret != ESP_OK)
+        {
             tx_power = -1;
             ESP_LOGE(TAG, "Failed read TX power: %s", esp_err_to_name(ret));
         }
-        else {
+        else
+        {
             tx_power = tx_power / 4;
         }
     }
     return tx_power;
 }
-void wifi_set_datarate(int datarate) {
+
+void wifi_set_datarate(uint16_t datarate)
+{
     tx_datarate = datarate;
 }
-void wifi_set_loop(uint8_t onOff) {
+void wifi_set_loop(uint8_t onOff)
+{
     tx_loopback = (onOff != 0);
 }
 
@@ -521,36 +633,10 @@ wifi_tx_rate_config_t tx_rate_config =
     .dcm = false
 };
 
-static int datarateKbpsToCode(uint32_t rate)
-{
-    switch (rate)
-    {
-    case 3000:
-        return WIFI_PHY_RATE_6M; // BPSK 1/2
-    case 4500:
-        return WIFI_PHY_RATE_9M; // BPSK 3/4
-    case 6000:
-        return WIFI_PHY_RATE_12M; // QPSK 1/2
-    case 9000:
-        return WIFI_PHY_RATE_18M; // QPSK 3/4
-    case 12000:
-        return WIFI_PHY_RATE_24M; // 16-QAM 1/2
-    case 18000:
-        return WIFI_PHY_RATE_36M; // 16-QAM 3/4
-    case 24000:
-        return WIFI_PHY_RATE_48M; // 64-QAM 1/2
-    case 27000:
-        return WIFI_PHY_RATE_54M; // 64-QAM 3/4
-
-    default:
-        break;
-    }
-    return WIFI_PHY_RATE_12M; // return default rate (6Mbps)
-}
-
 void wifi_tx_frame(uint8_t *payload, uint16_t length)
 {
-    if (length < sizeof(CommFrameHeader)) {
+    if (length < sizeof(CommFrameHeader))
+    {
         ESP_LOGW(TAG, "frame too short for header: %d < %d", length, (int)sizeof(CommFrameHeader));
         wifi_stats.txErr++;
         return;
@@ -560,18 +646,31 @@ void wifi_tx_frame(uint8_t *payload, uint16_t length)
     payload += sizeof(CommFrameHeader);
     length -= sizeof(CommFrameHeader);
 
-    if (ntohs(hdr->frameLen) != length) {
+    if (ntohs(hdr->frameLen) != length)
+    {
         ESP_LOGW(TAG, "frame length mismatch: %d != %d", ntohs(hdr->frameLen), length);
         wifi_stats.txErr++;
         return;
     }
 
-    if (tx_datarate >= 0) {
-        tx_rate_config.rate = datarateKbpsToCode(tx_datarate);
+    // allow channel in header as zero -> use default channel
+    // yet when provided must match currently tuned channel
+    uint16_t chan = ntohs(hdr->channel);
+    if (chan != 0 && chan != channel)
+    {
+        ESP_LOGW(TAG, "invalid channel: %u", chan);
+        wifi_stats.txErr++;
+        return;
     }
-    else {
-        tx_rate_config.rate = datarateKbpsToCode(6000);
+    chan = channel;
+
+    // allow rate in header as zero -> use default rate
+    uint16_t rate = ntohs(hdr->rate);
+    if (rate == 0)
+    {
+        rate = tx_datarate;
     }
+    tx_rate_config.rate = datarateKbpsToCode(rate);
 
     esp_err_t rc = esp_wifi_80211_tx_custom(WIFI_IF_STA,
         payload,
@@ -581,16 +680,19 @@ void wifi_tx_frame(uint8_t *payload, uint16_t length)
         WIFI_BAND_5G,
         WIFI_BW20);
 
-    if (rc != ESP_OK) {
+    if (rc != ESP_OK)
+    {
         wifi_stats.txErr++;
         ESP_LOGW(TAG, "frame tx failed: %s", esp_err_to_name(rc));
     }
-    else {
+    else
+    {
         wifi_stats.tx++;
         esp_event_post(WIFI_EVENT_BASE, WIFI_TRANSMIT_PACKET, NULL, 0, 0);
         ESP_LOGD(TAG, "TX: %d bytes", length);
-        if (tx_loopback) {
-            wifi_loopback(payload, length, hdr->channel, hdr->rate);
+        if (tx_loopback)
+        {
+            wifi_loopback(payload, length, chan, rate);
         }
     }
 }

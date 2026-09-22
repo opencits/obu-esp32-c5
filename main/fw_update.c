@@ -39,20 +39,19 @@ static void reply_nak(obu_comm_reply_fn reply, void *ctx, uint32_t value)
 }
 
 /* Radio hand-off for the transfer duration: frozen paused, so BLE gets the
- * whole airtime. Coex off first so coex_window_task can't resume in between;
- * then force the pause, since the USB rx task has already disabled coex
- * before dispatching FW_BEGIN and plain wifi_pause() would no-op.
- * cmd_tx.c's bare wifi_coex_disable() isn't reused: tx wants the radio
- * frozen active, this wants it frozen paused. */
+ * whole airtime. Hold first so coex_window_task can't resume in between;
+ * then force the pause, since the USB rx task already holds coex before
+ * dispatching FW_BEGIN and plain wifi_pause() would no-op. cmd_tx.c's bare
+ * hold isn't enough: tx wants the radio frozen active, this wants it paused. */
 static void radio_take_for_update(void)
 {
-    wifi_coex_disable();
+    wifi_coex_hold();
     wifi_pause_force();
 }
 
 static void radio_release_after_update(void)
 {
-    wifi_coex_enable();
+    wifi_coex_release();
 }
 
 static void reset_state(void)

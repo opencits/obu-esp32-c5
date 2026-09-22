@@ -127,19 +127,19 @@ static void usb_config_rx_task(void *arg)
         //  ^ Buffer          ^ End                      ^ MAX
         uint8_t* recvBufferStart = s_commBuffer + reassembler.end;
         int numRead = usb_serial_jtag_read_bytes(recvBufferStart, COMM_MAX_BUF_SIZE - reassembler.end, pdMS_TO_TICKS(50));
-        // when no more connection - restart WIFI/BLE COEX poll after paused
+        // when no more connection - release our coex hold after the idle period
         if (coex_resume_count > 0)
         {
             coex_resume_count--;
             if (coex_resume_count == 0)
             {
-                wifi_coex_enable();
+                wifi_coex_release();
             }
         }
         if (numRead <= 0) continue;
 
-        // got data - stop WIFI/BLE COEX poll
-        wifi_coex_disable();
+        // got data - hold WIFI/BLE COEX poll; count>0 means we already hold it
+        if (coex_resume_count == 0) wifi_coex_hold();
         coex_resume_count = 20*30;  // Resume after 30sec
 
         /* numRead bytes were already read directly into recvBufferStart, i.e.

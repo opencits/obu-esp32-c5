@@ -109,7 +109,7 @@ length-prefixed binary framing and share one dispatcher, so the protocol only ne
   passes `wifi_tx_frame`'s length check — don't mistake the first 16 bytes for part of the 802.11 frame when
   reading/editing that constant. (Was 14 bytes before `channel`/`rate` widened to `uint16_t`; if `CommFrameHeader`
   changes size again, `SAMPLE_PACKET_HEX` needs resplicing too or `tx` silently stops transmitting.)
-- Starting `tx` disables the BLE/sniffer coex scheduler (`wifi_coex_disable()`) for the lifetime of the task —
+- Starting `tx` takes a BLE/sniffer coex hold (`wifi_coex_hold()`), never released, for the lifetime of the task —
   transmitting and the sniff/BLE duty-cycle below don't run concurrently.
 
 ## BLE ⟷ sniffer coexistence (`main/bt_stream.c::coex_window_task`)
@@ -128,8 +128,10 @@ cycles — Galaxy S6 was the motivating case) actually see the advertisement bet
   starving the link for the full window.
 - `esp_coex_preference_set(ESP_COEX_PREFER_BT)` is set at BLE init so WiFi yields enough airtime for a full BLE
   adv packet to go out; flipped to `ESP_COEX_PREFER_WIFI` during a USB-triggered WiFi scan
-  (`usb_stream.c::cfg_scan_task`) and disabled entirely (`wifi_coex_disable()`) while the USB config-RX channel
-  has recent traffic or while `tx` is transmitting, so those don't fight the coex scheduler for the radio.
+  (`usb_stream.c::cfg_scan_task`) and frozen entirely (`wifi_coex_hold()`) while the USB config-RX channel
+  has recent traffic, while `tx` is transmitting, or during a FW update, so those don't fight the coex scheduler
+  for the radio. Holds are counted (`wifi_coex_release()` per hold): the scheduler only resumes once every holder
+  has released, so e.g. USB going idle can't restart sniffing in the middle of a BLE FW update.
 - This is now the *only* WiFi/radio scheduling in the codebase — there is no separate "sniffer ⟷ WiFi STA"
   cycle mode layered on top of it (see Connectivity below for why).
 
@@ -236,15 +238,12 @@ Two independent ways to get a new app image into the non-running OTA partition
   - `FW_CONFIRM` calls `ota_confirm_running_partition()` (`ota.h`) — the same
     `esp_ota_mark_app_valid_cancel_rollback()` + timer-stop logic `ota -C` uses, now shared between the console
     command and the wire protocol so a post-update client can cancel the anti-brick rollback remotely.
-  - **Radio hand-off**: `fw_update_begin()` calls `wifi_pause()` *then* `wifi_coex_disable()`, in that order —
-    not `wifi_coex_disable()` alone like `cmd_tx.c`. Both `wifi_pause()`/`wifi_resume()` early-return when
-    `!coex_enabled` (see "BLE ⟷ sniffer coexistence" above), so disabling coex while a sniff window happens to be
-    active freezes the radio *promiscuous-on*, starving BLE for the whole transfer — the opposite of what an
-    update needs. Pausing first (while coex is still enabled, so the guard doesn't block it) then disabling coex
-    freezes it paused/BLE-only instead. Released (`wifi_coex_enable()`) on `FW_END`/`FW_ABORT`/idle-timeout.
-    Applied unconditionally (BLE and USB both go through the same `fw_update_begin()`); harmless for USB, which
-    doesn't share the radio, and matches the existing defensive `wifi_coex_disable()` USB config traffic already
-    does in `usb_stream.c`.
+  - **Radio hand-off**: `fw_update_begin()` calls `wifi_coex_hold()` *then* `wifi_pause_force()` — not a bare
+    hold like `cmd_tx.c`. `wifi_pause()`/`wifi_resume()` no-op while any hold is outstanding (see "BLE ⟷ sniffer
+    coexistence" above), so a hold alone taken during a sniff window freezes the radio *promiscuous-on*, starving
+    BLE for the whole transfer. Holding first stops `coex_window_task` from resuming in between; the forced pause
+    then works even when the USB rx task already holds coex (it takes its hold before dispatching `FW_BEGIN`).
+    Released (`wifi_coex_release()`) on `FW_END`/`FW_ABORT`/idle-timeout. Applied for both BLE and USB.
 
 **Anti-brick safety net** (shared by both OTA paths): if the running partition isn't marked `VALID` at boot, a
 30-minute one-shot timer (`invalidate_and_reboot_timer`) is armed that force-rolls-back if the new firmware

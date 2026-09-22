@@ -1,5 +1,6 @@
 #include "sdkconfig.h"
 
+#include <stdatomic.h>
 #include <string.h>
 #include <stdlib.h>
 #include <sys/time.h>
@@ -39,7 +40,9 @@
 static const char TAG[] = "wifi";
 
 static bool is_running;
-static bool coex_enabled;
+/* Outstanding wifi_coex_hold()s (USB rx, tx task, FW update). While >0,
+ * wifi_pause()/wifi_resume() no-op, so coex_window_task can't move the radio. */
+static atomic_int coex_holds;
 
 static uint16_t channel;     // in MHZ : CCH
 static uint32_t filter;
@@ -368,7 +371,7 @@ void wifi_autostart(void)
 
 void wifi_pause(void)
 {
-  if (!coex_enabled) return;
+  if (atomic_load(&coex_holds) > 0) return;
   wifi_pause_force();
 }
 
@@ -386,7 +389,7 @@ void wifi_pause_force(void)
 void wifi_resume(void)
 {
   if (!wifi_paused) return;
-  if (!coex_enabled) return;
+  if (atomic_load(&coex_holds) > 0) return;
 
   ESP_LOGI(TAG, "resume WiFi");
   esp_wifi_start();
@@ -399,20 +402,25 @@ void wifi_resume(void)
   wifi_paused = false;
 }
 
-void wifi_coex_enable(void)
+void wifi_coex_hold(void)
 {
-    coex_enabled = true;
+    atomic_fetch_add(&coex_holds, 1);
 }
 
-void wifi_coex_disable(void)
+void wifi_coex_release(void)
 {
-    coex_enabled = false;
+    int n = atomic_load(&coex_holds);
+    do {
+        if (n <= 0) {
+            ESP_LOGE(TAG, "wifi_coex_release without matching hold");
+            return;
+        }
+    } while (!atomic_compare_exchange_weak(&coex_holds, &n, n - 1));
 }
 
 void wifi_init(void)
 {
   esp_err_t ret = ESP_OK;
-  coex_enabled = true;
 
   sem_task_over = xSemaphoreCreateBinary();
   ESP_GOTO_ON_FALSE(sem_task_over, ESP_FAIL, err, TAG, "create semaphore failed");

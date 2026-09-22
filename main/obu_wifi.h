@@ -58,12 +58,14 @@ int8_t wifi_get_txpower(void);
  */
 void wifi_pause(void);
 void wifi_resume(void);
-/* wifi_pause() without the coex_enabled guard. Call after wifi_coex_disable()
- * so coex_window_task can't resume the radio in between. */
+/* wifi_pause() ignoring coex holds. Call after wifi_coex_hold() so
+ * coex_window_task can't resume the radio in between. */
 void wifi_pause_force(void);
 
-void wifi_coex_enable(void);
-void wifi_coex_disable(void);
+/* Freeze the BLE/sniffer coex scheduler in its current radio state. Counted:
+ * every hold needs one release; scheduler runs again when all are released. */
+void wifi_coex_hold(void);
+void wifi_coex_release(void);
 
 /* Console cmd probing phy_get_cca_cnt/phy_set_cca_cnt, undocumented libphy.a
  * symbols reverse-engineered as a possible CCA busy/total counter pair for

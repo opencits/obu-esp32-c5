@@ -112,7 +112,7 @@ static int do_tx_cmd(int argc, char **argv) {
   }
 
   if (xTxHandle ==  NULL) {
-    wifi_coex_disable();
+    wifi_coex_hold();  /* never released: tx task lives until reboot */
     xTaskCreate( tx_task, "xTx", 4096, NULL, 4, &xTxHandle);
   }
   if (txInterval > 0)

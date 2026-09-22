@@ -6,6 +6,7 @@
 void usb_stream_init(void);
 void usb_stream_publish_packet(const wifi_packet_t *pkt);
 void usb_stream_send_ping(void);
+void usb_stream_publish_frame(uint16_t type, const uint8_t *payload, uint16_t len);
 
 /**
  * Start the USB RX config channel task.

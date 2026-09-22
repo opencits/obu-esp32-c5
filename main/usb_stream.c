@@ -6,6 +6,7 @@
 #include "driver/usb_serial_jtag.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "nvs.h"
 
@@ -22,6 +23,9 @@ static const char TAG[] = "USB_STREAM";
 static bool s_ready;
 
 static uint16_t s_comm_seqno;
+/* wifi_task, the rx task and tCbrInd all write frames; hold this across
+ * seqno + header + payload so frames never interleave on the wire. */
+static SemaphoreHandle_t s_tx_lock;
 static uint8_t s_commBuffer[COMM_MAX_BUF_SIZE];
 
 static uint16_t usb_inc_seqno()
@@ -31,9 +35,33 @@ static uint16_t usb_inc_seqno()
     return seqNo;
 }
 
+static void usb_write_frame(uint16_t type, const void *payload, uint16_t len)
+{
+    if (!s_ready) return;
+
+    CommHeader hdr;
+    hdr.magic = htons(COMM_MAGIC);
+    hdr.xferHeader.type = htons(type);
+    hdr.xferHeader.length = htons(len);
+
+    xSemaphoreTake(s_tx_lock, portMAX_DELAY);
+    hdr.seqNo = htons(usb_inc_seqno());
+    usb_serial_jtag_write_bytes(&hdr, sizeof(hdr), pdMS_TO_TICKS(50));
+    if (len > 0) {
+        usb_serial_jtag_write_bytes(payload, len, pdMS_TO_TICKS(50));
+    }
+    xSemaphoreGive(s_tx_lock);
+}
+
 void usb_stream_init(void)
 {
     if (s_ready) return;
+
+    if (!s_tx_lock) s_tx_lock = xSemaphoreCreateMutex();
+    if (!s_tx_lock) {
+        ESP_LOGE(TAG, "create tx lock failed");
+        return;
+    }
 
     usb_serial_jtag_driver_config_t cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
     cfg.tx_buffer_size = 4096;
@@ -54,28 +82,14 @@ void usb_stream_publish_packet(const wifi_packet_t *pkt)
     if (!s_ready) usb_stream_init();
     if (!s_ready) return;
 
-    CommHeader hdr;
-    hdr.magic = htons(COMM_MAGIC);
-    hdr.seqNo = htons(usb_inc_seqno());
-
-    hdr.xferHeader.type = htons(COMM_FRAME_RX);
-    hdr.xferHeader.length = htons(pkt->length);
-
-    usb_serial_jtag_write_bytes(&hdr, sizeof(hdr), pdMS_TO_TICKS(50));
-    usb_serial_jtag_write_bytes(pkt->payload, pkt->length, pdMS_TO_TICKS(50));
+    usb_write_frame(COMM_FRAME_RX, pkt->payload, pkt->length);
 
     led_pulse_usb();
 }
 
 void usb_stream_send_ping(void)
 {
-    CommHeader hdr;
-    hdr.magic = htons(COMM_MAGIC);
-    hdr.seqNo = htons(usb_inc_seqno());
-
-    hdr.xferHeader.type = htons(COMM_FRAME_PING);
-    hdr.xferHeader.length = 0;
-    usb_serial_jtag_write_bytes(&hdr, sizeof(hdr), pdMS_TO_TICKS(50));
+    usb_write_frame(COMM_FRAME_PING, NULL, 0);
 }
 
 /* ── USB RX config channel ──────────────────────────────────────────────
@@ -86,15 +100,12 @@ void usb_stream_send_ping(void)
 static void usb_reply(uint16_t type, const uint8_t *payload, uint16_t len, void *ctx)
 {
     (void)ctx;
-    CommHeader hdr;
-    hdr.magic = htons(COMM_MAGIC);
-    hdr.seqNo = htons(usb_inc_seqno());
-    hdr.xferHeader.type = htons(type);
-    hdr.xferHeader.length = htons(len);
-    usb_serial_jtag_write_bytes(&hdr, sizeof(hdr), pdMS_TO_TICKS(50));
-    if (len > 0) {
-        usb_serial_jtag_write_bytes(payload, len, pdMS_TO_TICKS(50));
-    }
+    usb_write_frame(type, payload, len);
+}
+
+void usb_stream_publish_frame(uint16_t type, const uint8_t *payload, uint16_t len)
+{
+    usb_write_frame(type, payload, len);
 }
 
 static void on_usb_frame(uint16_t type, uint16_t length, uint8_t *payload, void *ctx)

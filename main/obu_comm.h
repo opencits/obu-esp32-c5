@@ -32,6 +32,14 @@
 #define COMM_FRAME_FW_ACK      45
 #define COMM_FRAME_FW_NAK      46
 
+/* ETSI DCC channel-busy-ratio (CBR), see docs/esp_dcc_measurements.md. READ
+ * gets one CBR_IND immediately; START/STOP gate a periodic CBR_IND push
+ * (USB/BLE, whichever is connected) driven by wifi_cbr_ind_start/stop. */
+#define COMM_FRAME_CMD_CBR_READ   50
+#define COMM_FRAME_CMD_CBR_START  51
+#define COMM_FRAME_CMD_CBR_STOP   52
+#define COMM_FRAME_CBR_IND        53
+
 #define COMM_MAX_BUF_SIZE (64*1024)
 
 typedef struct
@@ -75,6 +83,24 @@ typedef struct {
 typedef struct {
   uint32_t value;
 } __packed FwAckPayload;
+
+/* Upper bound keeps pdMS_TO_TICKS' 32-bit ms*HZ product from overflowing. */
+#define CBR_IND_MAX_INTERVAL_MS 3600000u
+
+/* CBR_START payload: periodic CBR_IND push interval, 1..CBR_IND_MAX_INTERVAL_MS. */
+typedef struct {
+  uint32_t intervalMs;
+} __packed CbrStartPayload;
+
+/* CBR_IND payload: percent fields are milli-percent (percent*1000, so 0..100000)
+ * to keep floats off the wire, same convention as every other multi-byte field
+ * here. validSamples==0 means no CBR window has been measured yet. */
+typedef struct {
+  uint32_t avgPercentMilli;
+  uint32_t latestPercentMilli;
+  uint32_t validSamples;
+  uint32_t rejectedSamples;
+} __packed CbrIndPayload;
 
 /* Per-channel state for obu_comm_feed(); USB and BLE each keep their own
  * instance over their own buffer since the two links reassemble independently. */

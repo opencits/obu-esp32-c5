@@ -1099,3 +1099,55 @@ void register_dccmon_cmd(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
 }
+
+// ============================ CBR_IND (wire protocol push) =================
+// Same data as `dccmon`, pushed as COMM_FRAME_CBR_IND over USB/BLE (whichever
+// is connected) instead of printed — gated by COMM_FRAME_CMD_CBR_START/STOP
+// (obu_comm.c). Mirrors wifi_task's existing dual-publish-if-connected pattern.
+
+static int cbr_ind_interval_ms = -1; // <=0: task idles, doesn't publish
+static TaskHandle_t cbr_ind_task;
+
+static void cbr_ind_publish(void)
+{
+    wifi_cca_stats_t stats;
+    wifi_get_cca_stats(&stats);
+
+    CbrIndPayload ind = {
+        .avgPercentMilli = htonl((uint32_t)(stats.avg_percent * 1000.0f)),
+        .latestPercentMilli = htonl((uint32_t)(stats.latest_percent * 1000.0f)),
+        .validSamples = htonl(stats.valid_samples),
+        .rejectedSamples = htonl(stats.rejected_samples),
+    };
+
+    if (obu_comm_usb_connected()) usb_stream_publish_frame(COMM_FRAME_CBR_IND, (const uint8_t *)&ind, sizeof(ind));
+    if (obu_comm_ble_connected()) bt_stream_publish_frame(COMM_FRAME_CBR_IND, (const uint8_t *)&ind, sizeof(ind));
+}
+
+static void cbr_ind_task_fn(void *arg)
+{
+    for (;;)
+    {
+        if (cbr_ind_interval_ms <= 0)
+        {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+        cbr_ind_publish();
+        vTaskDelay(pdMS_TO_TICKS(cbr_ind_interval_ms));
+    }
+}
+
+void wifi_cbr_ind_start(uint32_t interval_ms)
+{
+    cbr_ind_interval_ms = (int)interval_ms;
+    if (!cbr_ind_task)
+    {
+        xTaskCreate(cbr_ind_task_fn, "tCbrInd", 3072, NULL, 2, &cbr_ind_task);
+    }
+}
+
+void wifi_cbr_ind_stop(void)
+{
+    cbr_ind_interval_ms = -1;
+}

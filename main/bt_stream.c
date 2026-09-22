@@ -613,3 +613,10 @@ void bt_stream_publish_packet(const wifi_packet_t *pkt)
     if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE || !s_notify_enabled) return;
     bt_enqueue_frame(COMM_FRAME_RX, pkt->payload, pkt->length);
 }
+
+void bt_stream_publish_frame(uint16_t type, const uint8_t *payload, uint16_t len)
+{
+    if (!s_ready) return;
+    if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE || !s_notify_enabled) return;
+    bt_enqueue_frame(type, payload, len);
+}

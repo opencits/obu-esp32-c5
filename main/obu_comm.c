@@ -347,6 +347,45 @@ static void on_stop(uint8_t *frame, uint16_t frame_len, obu_comm_reply_fn reply,
     reply(COMM_FRAME_CMD_FAIL, NULL, 0, ctx);
 }
 
+static void on_cbr_read(obu_comm_reply_fn reply, void *ctx)
+{
+    wifi_cca_stats_t stats;
+    wifi_get_cca_stats(&stats);
+
+    CbrIndPayload ind = {
+        .avgPercentMilli = htonl((uint32_t)(stats.avg_percent * 1000.0f)),
+        .latestPercentMilli = htonl((uint32_t)(stats.latest_percent * 1000.0f)),
+        .validSamples = htonl(stats.valid_samples),
+        .rejectedSamples = htonl(stats.rejected_samples),
+    };
+    reply(COMM_FRAME_CBR_IND, (const uint8_t *)&ind, sizeof(ind), ctx);
+}
+
+static void on_cbr_start(uint8_t *frame, uint16_t frame_len, obu_comm_reply_fn reply, void *ctx)
+{
+    if (frame_len != sizeof(CbrStartPayload)) {
+        ESP_LOGW(TAG, "Invalid CBR_START frame length: %d", frame_len);
+        reply(COMM_FRAME_CMD_FAIL, NULL, 0, ctx);
+        return;
+    }
+    CbrStartPayload req;
+    memcpy(&req, frame, sizeof(req));
+    uint32_t intervalMs = ntohl(req.intervalMs);
+    if (intervalMs == 0 || intervalMs > CBR_IND_MAX_INTERVAL_MS) {
+        ESP_LOGW(TAG, "CBR_START: interval %lu out of range", (unsigned long)intervalMs);
+        reply(COMM_FRAME_CMD_FAIL, NULL, 0, ctx);
+        return;
+    }
+    wifi_cbr_ind_start(intervalMs);
+    reply(COMM_FRAME_CMD_GOOD, NULL, 0, ctx);
+}
+
+static void on_cbr_stop(obu_comm_reply_fn reply, void *ctx)
+{
+    wifi_cbr_ind_stop();
+    reply(COMM_FRAME_CMD_GOOD, NULL, 0, ctx);
+}
+
 void obu_comm_process_frame(uint16_t type, uint16_t length, uint8_t *payload,
                              obu_comm_reply_fn reply, void *ctx)
 {
@@ -391,6 +430,16 @@ void obu_comm_process_frame(uint16_t type, uint16_t length, uint8_t *payload,
             break;
         case COMM_FRAME_FW_CONFIRM:
             fw_update_confirm(reply, ctx);
+            break;
+
+        case COMM_FRAME_CMD_CBR_READ:
+            on_cbr_read(reply, ctx);
+            break;
+        case COMM_FRAME_CMD_CBR_START:
+            on_cbr_start(payload, length, reply, ctx);
+            break;
+        case COMM_FRAME_CMD_CBR_STOP:
+            on_cbr_stop(reply, ctx);
             break;
 
         default:

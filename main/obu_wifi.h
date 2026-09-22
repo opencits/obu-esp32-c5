@@ -87,6 +87,12 @@ void wifi_get_cca_stats(wifi_cca_stats_t *stats);
 void register_cca_stats_cmd(void); // `ccastats` console command, read-only
 void register_dccmon_cmd(void);    // `dccmon` console command, periodic background printer
 
+/* Periodic COMM_FRAME_CBR_IND push over USB/BLE (whichever is connected),
+ * driven by COMM_FRAME_CMD_CBR_START/STOP — see obu_comm.c. interval_ms must be
+ * 1..CBR_IND_MAX_INTERVAL_MS; obu_comm.c validates before calling. */
+void wifi_cbr_ind_start(uint32_t interval_ms);
+void wifi_cbr_ind_stop(void);
+
 #ifdef __cplusplus
 }
 #endif

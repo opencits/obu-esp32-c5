@@ -24,7 +24,12 @@
 
 static const char TAG[] = "SNIFFER";
 
-static const char* SAMPLE_PACKET_HEX = "b47000000000000000000000007988000000ffffffffffff000000000000ffffffffffff60002100aaaa0300000089471100140120500280002f010014000064cafebabe000000001cc4ff8409c98951000000000000000007d1000002020000000000004056b49d200d693a401ffffffc23b7743e00e11fc0007e3fe9ed0737feebfff6000000";
+/* synthetic 16-byte CommFrameHeader (channel=0, rate=0 -> use current defaults;
+ * frameLen=0x0079=121) spliced onto the real captured 802.11 frame, sized to
+ * pass wifi_tx_frame's length check. Was 14 bytes before CommFrameHeader's
+ * channel/rate fields widened to uint16_t ("Integration with Apps"); resized
+ * here to match — don't mistake the first 16 bytes for part of the 802.11 frame. */
+static const char* SAMPLE_PACKET_HEX = "0000000000000000000000000000007988000000ffffffffffff000000000000ffffffffffff60002100aaaa0300000089471100140120500280002f010014000064cafebabe000000001cc4ff8409c98951000000000000000007d1000002020000000000004056b49d200d693a401ffffffc23b7743e00e11fc0007e3fe9ed0737feebfff6000000";
 
 static int txInterval = -1;
 static TaskHandle_t xTxHandle = NULL;

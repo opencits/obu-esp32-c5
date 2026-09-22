@@ -14,6 +14,8 @@
 #include "esp_timer.h"
 #include "argtable3/argtable3.h"
 
+#include "ota.h"
+
 #define OTA_TASK_STACK_SIZE 2048
 #define OTA_TASK_PRIORITY 20
 
@@ -127,17 +129,10 @@ static int ota_cmd(int argc, char **argv)
 
     if (ota_args.confirm->count)
     {
-        int res = esp_ota_mark_app_valid_cancel_rollback();
+        esp_err_t res = ota_confirm_running_partition();
         if (res != ESP_OK)
         {
-            ESP_LOGE(TAG, "esp_ota_mark_app_valid_cancel_rollback failed: %s", esp_err_to_name(res));
             return 1;
-        }
-
-        res = esp_timer_stop(invalidate_and_reboot_timer);
-        if (res != ESP_OK)
-        {
-            ESP_LOGW(TAG, "esp_timer_stop failed: %s. Maybe this app partition was already marked valid?", esp_err_to_name(res));
         }
     }
 
@@ -304,6 +299,23 @@ static void init_invalidate_and_reboot_timer(void)
         ESP_LOGW(TAG, "Current app partition is not marked valid, will perform rollback in 30 minutes if not confirmed by then!");
         esp_timer_start_once(invalidate_and_reboot_timer, (uint64_t)30 * 60 * 1000 * 1000);
     }
+}
+
+esp_err_t ota_confirm_running_partition(void)
+{
+    esp_err_t res = esp_ota_mark_app_valid_cancel_rollback();
+    if (res != ESP_OK)
+    {
+        ESP_LOGE(TAG, "esp_ota_mark_app_valid_cancel_rollback failed: %s", esp_err_to_name(res));
+        return res;
+    }
+
+    res = esp_timer_stop(invalidate_and_reboot_timer);
+    if (res != ESP_OK)
+    {
+        ESP_LOGW(TAG, "esp_timer_stop failed: %s. Maybe this app partition was already marked valid?", esp_err_to_name(res));
+    }
+    return ESP_OK;
 }
 
 void ota_init(void)

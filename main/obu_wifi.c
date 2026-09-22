@@ -58,6 +58,40 @@ static SemaphoreHandle_t sem_task_over;
 void phy_change_channel(int,int,int,int);
 void phy_11p_set(int,int);
 
+/* phy_get_cca_cnt/phy_set_cca_cnt: undocumented libphy.a symbols, no caller
+ * anywhere in esp-idf to confirm against. Reverse-engineered from esp32c5
+ * phy_feature.o disassembly, then confirmed against real hardware via
+ * `ccatest` (see obu_wifi module CLAUDE notes / session log for the trace):
+ *   - phy_set_cca_cnt(value, onOff): low 27 bits of `value` set a cycle-count
+ *     ceiling in a control reg (0x600A7C58, top 5 bits preserved elsewhere).
+ *     onOff!=0 pulses bits 27-28 (self-clearing — reads back as 0 immediately
+ *     after) which resets and (re)starts both counters below from 0.
+ *   - phy_get_cca_cnt(out): reads two adjacent 28-bit free-running counters —
+ *     0x600A7C5C ("total", confirmed to tick at ~39.8 MHz, i.e. the PHY's
+ *     40 MHz ref clock: elapsed cycles since last start) and 0x600A7C60
+ *     ("busy", confirmed to grow much slower and independently — consistent
+ *     with CCA-busy cycles, though not yet causally tied to known TX/RX
+ *     activity). Both mask to the low 27 bits for out->total/out->busy; bit 27
+ *     of the total reg is split out as the return value, which is set once
+ *     `total` reaches the configured ceiling — at that point both counters
+ *     freeze (no wraparound) until the next start pulse. Max single-shot
+ *     window at ~40 MHz is 134217727/40e6 ~= 3.35s.
+ *   - busy/total ratio == CCA channel-busy ratio, ready for ITS-G5 DCC use
+ *     once the causal TX link is confirmed. See `ccatest`.
+ */
+typedef struct {
+    uint32_t total; // elapsed PHY clock cycles since last (re)start, ~40MHz, caps at 0x07FFFFFF
+    uint32_t busy;  // CCA-busy cycles accumulated over the same window
+} phy_cca_cnt_t;
+void phy_set_cca_cnt(uint32_t value, int onOff);
+bool phy_get_cca_cnt(phy_cca_cnt_t *out);
+
+// raw MMIO addresses backing the above, for cross-checking the guessed struct
+// layout independent of phy_get_cca_cnt's own masking/shifting.
+#define PHY_CCA_CTRL_REG   (*(volatile uint32_t *)0x600A7C58)
+#define PHY_CCA_CNT_A_REG  (*(volatile uint32_t *)0x600A7C5C)
+#define PHY_CCA_CNT_B_REG  (*(volatile uint32_t *)0x600A7C60)
+
 static int datarateKbpsToCode(uint16_t rate)
 {
     switch (rate)
@@ -334,8 +368,13 @@ void wifi_autostart(void)
 
 void wifi_pause(void)
 {
-  if (wifi_paused) return;
   if (!coex_enabled) return;
+  wifi_pause_force();
+}
+
+void wifi_pause_force(void)
+{
+  if (wifi_paused) return;
 
   ESP_LOGI(TAG, "pause WiFi");
   esp_wifi_set_promiscuous(false);
@@ -695,4 +734,368 @@ void wifi_tx_frame(uint8_t *payload, uint16_t length)
             wifi_loopback(payload, length, chan, rate);
         }
     }
+}
+
+// ============================ CCA/DCC TEST (experimental) ==================
+// Diagnostic for the phy_get_cca_cnt/phy_set_cca_cnt hooks above. Counter
+// semantics (ceiling, self-clearing start pulse, ~40MHz tick rate) confirmed
+// against real hardware; the busy counter's causal link to actual channel
+// traffic is not yet confirmed. Not for production DCC use until it is.
+
+#define CCA_TEST_CANARY 0xA5A5A5A5u
+
+static struct {
+    struct arg_int *window;
+    struct arg_int *samples;
+    struct arg_int *interval;
+    struct arg_lit *no_start;
+    struct arg_end *end;
+} cca_test_args;
+
+static int do_cca_test_cmd(int argc, char **argv)
+{
+    int nerrors = arg_parse(argc, argv, (void **)&cca_test_args);
+    if (nerrors != 0)
+    {
+        arg_print_errors(stderr, cca_test_args.end, argv[0]);
+        return 0;
+    }
+
+    uint32_t window = 40000000u; // ~1s at the confirmed ~39.8MHz tick rate (ETSI TS 102 687 default CBR interval)
+    if (cca_test_args.window->count)
+    {
+        window = (uint32_t)cca_test_args.window->ival[0];
+    }
+    int samples = cca_test_args.samples->count ? cca_test_args.samples->ival[0] : 10;
+    int interval_ms = cca_test_args.interval->count ? cca_test_args.interval->ival[0] : 1000;
+    bool do_start = !cca_test_args.no_start->count;
+
+    fprintf(stdout, "ccatest: undocumented PHY registers, may destabilize the radio; power-cycle if it hangs\n");
+    fprintf(stdout, "ccatest: ctrl=0x%08x cntA=0x%08x cntB=0x%08x (before)\n",
+        (unsigned)PHY_CCA_CTRL_REG, (unsigned)PHY_CCA_CNT_A_REG, (unsigned)PHY_CCA_CNT_B_REG);
+
+    if (do_start)
+    {
+        phy_set_cca_cnt(window, 1);
+        fprintf(stdout, "ccatest: phy_set_cca_cnt(0x%08x, 1) called\n", (unsigned)window);
+    }
+    else
+    {
+        fprintf(stdout, "ccatest: --no-start, sampling existing counter state only\n");
+    }
+
+    phy_cca_cnt_t prev = {0};
+    bool have_prev = false;
+
+    for (int i = 0; i < samples; i++)
+    {
+        vTaskDelay(pdMS_TO_TICKS(interval_ms));
+
+        // guard bytes past the 8 used bytes catch phy_get_cca_cnt writing more than expected
+        uint32_t buf[8];
+        for (int j = 0; j < 8; j++) buf[j] = CCA_TEST_CANARY;
+        phy_cca_cnt_t *out = (phy_cca_cnt_t *)buf;
+        bool flag = phy_get_cca_cnt(out);
+
+        int overrun = -1;
+        for (int j = 2; j < 8; j++)
+        {
+            if (buf[j] != CCA_TEST_CANARY) { overrun = j; break; }
+        }
+
+        uint32_t raw_ctrl = PHY_CCA_CTRL_REG;
+        uint32_t raw_a = PHY_CCA_CNT_A_REG;
+        uint32_t raw_b = PHY_CCA_CNT_B_REG;
+
+        fprintf(stdout, "ccatest[%d]: total=%u busy=%u flag=%d | raw ctrl=0x%08x cntA=0x%08x cntB=0x%08x",
+            i, (unsigned)out->total, (unsigned)out->busy, flag,
+            (unsigned)raw_ctrl, (unsigned)raw_a, (unsigned)raw_b);
+
+        if (overrun >= 0)
+        {
+            fprintf(stdout, " | WROTE PAST 8 BYTES at word %d = 0x%08x", overrun, (unsigned)buf[overrun]);
+        }
+
+        if (have_prev)
+        {
+            uint32_t d_total = out->total - prev.total; // wraps naturally if counter reset/overflowed
+            uint32_t d_busy = out->busy - prev.busy;
+            if (d_total > 0)
+            {
+                fprintf(stdout, " | delta busy/total=%u/%u (%.1f%%)",
+                    (unsigned)d_busy, (unsigned)d_total, 100.0 * d_busy / d_total);
+            }
+            else
+            {
+                fprintf(stdout, " | delta total=0 (counter idle or reset)");
+            }
+        }
+        fprintf(stdout, "\n");
+
+        prev = *out;
+        have_prev = true;
+    }
+
+    return 0;
+}
+
+void register_cca_test_cmd(void)
+{
+    cca_test_args.window = arg_int0("w", "window", "<cycles>", "count ceiling passed to phy_set_cca_cnt, PHY clock cycles @ ~39.8MHz, max 0x07FFFFFF (~3.35s) (default ~1s)");
+    cca_test_args.samples = arg_int0("n", "samples", "<n>", "number of samples to take (default 10)");
+    cca_test_args.interval = arg_int0("i", "interval", "<ms>", "delay between samples in ms (default 1000)");
+    cca_test_args.no_start = arg_lit0(NULL, "no-start", "don't call phy_set_cca_cnt, just sample current counter state");
+    cca_test_args.end = arg_end(2);
+
+    const esp_console_cmd_t cca_test_cmd = {
+        .command = "ccatest",
+        .help = "EXPERIMENTAL: probe undocumented PHY CCA busy/total counters (see obu_wifi.c comment above do_cca_test_cmd)",
+        .hint = NULL,
+        .func = &do_cca_test_cmd,
+        .argtable = &cca_test_args
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&cca_test_cmd));
+}
+
+// ============================ CCA/DCC MEASUREMENT (background) ============
+// Continuous ETSI ITS-G5 DCC channel-busy-ratio measurement, built on the
+// hardware validation in docs/esp_dcc_measurements.md (confirmed against a
+// reference load generator across idle/~5%/~10%/~45% channel load).
+
+#define CCA_WINDOW_CYCLES     40000000u // ~1s at the confirmed ~39.8MHz tick rate
+#define CCA_WINDOW_WAIT_MS    1100      // window + margin: ~39.8MHz needs ~1005ms to reach the ceiling
+#define CCA_HISTORY_LEN       5         // rolling window for the filtered average
+#define CCA_OUTLIER_LOW_FRAC  0.5f      // drop samples below this fraction of the median: low dropouts were observed whenever a window landed in a gap of the reference generator's duty cycle, never a high spike (high spikes are the separate busy>total race, clamped below, not filtered here)
+#define CCA_TASK_STACK        3072
+#define CCA_TASK_PRIORITY     3
+
+static SemaphoreHandle_t cca_mutex;
+static TaskHandle_t cca_task;
+static float cca_history[CCA_HISTORY_LEN];
+static uint8_t cca_history_count;
+static uint8_t cca_history_next;
+static wifi_cca_stats_t cca_stats;
+
+static int cca_float_cmp(const void *a, const void *b)
+{
+    float fa = *(const float *)a, fb = *(const float *)b;
+    return (fa > fb) - (fa < fb);
+}
+
+/* Mean of the history, excluding samples below CCA_OUTLIER_LOW_FRAC * median.
+ * Falls back to the plain mean if that excludes everything (shouldn't happen:
+ * the median itself always qualifies). Caller holds cca_mutex. */
+static float cca_filtered_average(void)
+{
+    float sorted[CCA_HISTORY_LEN];
+    memcpy(sorted, cca_history, cca_history_count * sizeof(float));
+    qsort(sorted, cca_history_count, sizeof(float), cca_float_cmp);
+    float median = sorted[cca_history_count / 2];
+    float threshold = median * CCA_OUTLIER_LOW_FRAC;
+
+    float sum = 0;
+    int n = 0;
+    for (int i = 0; i < cca_history_count; i++)
+    {
+        if (cca_history[i] >= threshold)
+        {
+            sum += cca_history[i];
+            n++;
+        }
+    }
+    if (n == 0)
+    {
+        for (int i = 0; i < cca_history_count; i++) sum += cca_history[i];
+        n = cca_history_count;
+    }
+    return sum / n;
+}
+
+static void cca_measure_task(void *arg)
+{
+    uint32_t last_total = 0, last_busy = 0;
+    bool have_last = false;
+
+    for (;;)
+    {
+        phy_set_cca_cnt(CCA_WINDOW_CYCLES, 1);
+        vTaskDelay(pdMS_TO_TICKS(CCA_WINDOW_WAIT_MS));
+
+        phy_cca_cnt_t raw;
+        bool flag = phy_get_cca_cnt(&raw);
+
+        /* A genuinely completed window always reports exactly the configured
+         * ceiling. Anything else — never started, or a stale re-read of an
+         * earlier window after a start-pulse miss-fire (see
+         * docs/esp_dcc_measurements.md) — is discarded, not averaged. */
+        bool duplicate = have_last && raw.total == last_total && raw.busy == last_busy;
+        bool valid = flag && raw.total == CCA_WINDOW_CYCLES && !duplicate;
+
+        last_total = raw.total;
+        last_busy = raw.busy;
+        have_last = true;
+
+        if (!valid)
+        {
+            xSemaphoreTake(cca_mutex, portMAX_DELAY);
+            cca_stats.rejected_samples++;
+            xSemaphoreGive(cca_mutex);
+            continue;
+        }
+
+        uint32_t busy = raw.busy > raw.total ? raw.total : raw.busy; // busy>total race, see doc
+        float percent = 100.0f * (float)busy / (float)raw.total;
+
+        xSemaphoreTake(cca_mutex, portMAX_DELAY);
+        cca_history[cca_history_next] = percent;
+        cca_history_next = (cca_history_next + 1) % CCA_HISTORY_LEN;
+        if (cca_history_count < CCA_HISTORY_LEN) cca_history_count++;
+
+        cca_stats.latest_percent = percent;
+        cca_stats.avg_percent = cca_filtered_average();
+        cca_stats.valid_samples++;
+        cca_stats.has_data = true;
+        xSemaphoreGive(cca_mutex);
+    }
+}
+
+void wifi_cca_start(void)
+{
+    if (cca_task) return;
+
+    cca_mutex = xSemaphoreCreateMutex();
+    if (!cca_mutex)
+    {
+        ESP_LOGE(TAG, "cca: create mutex failed");
+        return;
+    }
+    if (xTaskCreate(cca_measure_task, "tCca", CCA_TASK_STACK, NULL, CCA_TASK_PRIORITY, &cca_task) != pdTRUE)
+    {
+        ESP_LOGE(TAG, "cca: create task failed");
+        cca_task = NULL;
+    }
+}
+
+void wifi_get_cca_stats(wifi_cca_stats_t *stats)
+{
+    if (!cca_mutex)
+    {
+        memset(stats, 0, sizeof(*stats));
+        return;
+    }
+    xSemaphoreTake(cca_mutex, portMAX_DELAY);
+    *stats = cca_stats;
+    xSemaphoreGive(cca_mutex);
+}
+
+static int do_cca_stats_cmd(int argc, char **argv)
+{
+    wifi_cca_stats_t stats;
+    wifi_get_cca_stats(&stats);
+    if (!stats.has_data)
+    {
+        fprintf(stdout, "no valid CBR window yet (valid=%lu rejected=%lu)\n",
+            (unsigned long)stats.valid_samples, (unsigned long)stats.rejected_samples);
+        return 0;
+    }
+    fprintf(stdout, "CBR latest=%.3f%% avg=%.3f%% (valid=%lu rejected=%lu)\n",
+        stats.latest_percent, stats.avg_percent,
+        (unsigned long)stats.valid_samples, (unsigned long)stats.rejected_samples);
+    return 0;
+}
+
+void register_cca_stats_cmd(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "ccastats",
+        .help = "show background ETSI DCC channel-busy-ratio measurement (see wifi_cca_start)",
+        .hint = NULL,
+        .func = &do_cca_stats_cmd,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
+}
+
+// ============================ DCCMON (background printer) =================
+// `dccmon` console cmd starts/stops a background task that periodically logs
+// wifi_get_cca_stats()'s filtered average — a live view of the CBR measured
+// in docs/esp_dcc_measurements.md, without blocking the console like `ccatest`.
+
+static int dccmon_interval_ms = -1; // <=0: task idles, doesn't print
+static TaskHandle_t dccmon_task;
+
+static void dccmon_task_fn(void *arg)
+{
+    for (;;)
+    {
+        if (dccmon_interval_ms <= 0)
+        {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        wifi_cca_stats_t stats;
+        wifi_get_cca_stats(&stats);
+        if (stats.has_data)
+        {
+            /* fprintf, not ESP_LOGI: CONFIG_LOG_DEFAULT_LEVEL=2 (WARN) in this
+             * project's sdkconfig drops INFO-level logs silently. */
+            fprintf(stdout, "dccmon: CBR avg=%.2f%% latest=%.2f%% (valid=%lu rejected=%lu)\n",
+                stats.avg_percent, stats.latest_percent,
+                (unsigned long)stats.valid_samples, (unsigned long)stats.rejected_samples);
+        }
+        else
+        {
+            fprintf(stdout, "dccmon: no valid CBR window yet (rejected=%lu)\n",
+                (unsigned long)stats.rejected_samples);
+        }
+        vTaskDelay(pdMS_TO_TICKS(dccmon_interval_ms));
+    }
+}
+
+static struct {
+    struct arg_int *interval;
+    struct arg_lit *stop;
+    struct arg_end *end;
+} dccmon_args;
+
+static int do_dccmon_cmd(int argc, char **argv)
+{
+    int nerrors = arg_parse(argc, argv, (void **)&dccmon_args);
+    if (nerrors != 0)
+    {
+        arg_print_errors(stderr, dccmon_args.end, argv[0]);
+        return 0;
+    }
+
+    if (dccmon_args.stop->count)
+    {
+        dccmon_interval_ms = -1;
+        fprintf(stdout, "dccmon stopped\n");
+        return 0;
+    }
+
+    dccmon_interval_ms = dccmon_args.interval->count ? dccmon_args.interval->ival[0] : 2000;
+
+    if (!dccmon_task)
+    {
+        xTaskCreate(dccmon_task_fn, "tDccMon", 3072, NULL, 2, &dccmon_task);
+    }
+    fprintf(stdout, "dccmon printing every %d ms\n", dccmon_interval_ms);
+    return 0;
+}
+
+void register_dccmon_cmd(void)
+{
+    dccmon_args.interval = arg_int0("i", "interval", "<ms>", "print interval in ms (default 2000)");
+    dccmon_args.stop = arg_lit0(NULL, "stop", "stop printing");
+    dccmon_args.end = arg_end(1);
+
+    const esp_console_cmd_t cmd = {
+        .command = "dccmon",
+        .help = "periodically print the background ETSI DCC channel-busy-ratio average",
+        .hint = NULL,
+        .func = &do_dccmon_cmd,
+        .argtable = &dccmon_args
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
 }

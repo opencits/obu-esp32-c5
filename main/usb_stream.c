@@ -37,7 +37,8 @@ void usb_stream_init(void)
 
     usb_serial_jtag_driver_config_t cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
     cfg.tx_buffer_size = 4096;
-    cfg.rx_buffer_size = 256;
+    cfg.rx_buffer_size = 4096;  /* was 256 — FW_DATA update chunks can arrive faster than
+                                 * usb_config_rx_task's 50ms poll loop can drain a small ring */
 
     esp_err_t err = usb_serial_jtag_driver_install(&cfg);
     if (err == ESP_OK || err == ESP_ERR_INVALID_STATE) {

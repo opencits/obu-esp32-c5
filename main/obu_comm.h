@@ -3,7 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define COMM_VERSION "0.5"
+#define COMM_VERSION "0.6"
 
 #define COMM_MAGIC 0x7384
 
@@ -20,6 +20,17 @@
 
 #define COMM_FRAME_RX    30
 #define COMM_FRAME_TX    31
+
+/* Firmware push over the existing wire protocol (BLE/USB), into esp_ota_*
+ * directly — bypasses esp_https_ota, whose WiFi STA never actually
+ * associates in this firmware. See fw_update.c. */
+#define COMM_FRAME_FW_BEGIN    40
+#define COMM_FRAME_FW_DATA     41
+#define COMM_FRAME_FW_END      42
+#define COMM_FRAME_FW_ABORT    43
+#define COMM_FRAME_FW_CONFIRM  44
+#define COMM_FRAME_FW_ACK      45
+#define COMM_FRAME_FW_NAK      46
 
 #define COMM_MAX_BUF_SIZE (64*1024)
 
@@ -45,6 +56,25 @@ typedef struct {
   uint32_t microseconds;
   uint16_t frameLen;
 } __packed CommFrameHeader;
+
+/* FW_BEGIN payload. Network byte order (htonl/ntohl), same convention as
+ * every other multi-byte field in this protocol (CommHeader, CommFrameHeader) —
+ * fields below are wire-format and must be swapped explicitly on this
+ * little-endian chip, never memcpy'd straight into use. */
+typedef struct {
+  uint32_t totalSize;
+} __packed FwBeginPayload;
+
+/* FW_DATA payload prefix; raw image bytes follow. */
+typedef struct {
+  uint32_t offset;
+} __packed FwDataHeader;
+
+/* FW_ACK/FW_NAK payload: bytes written so far (ACK) or expected offset to
+ * resume from (NAK); 0 on a NAK unrelated to offset (e.g. not active). */
+typedef struct {
+  uint32_t value;
+} __packed FwAckPayload;
 
 /* Per-channel state for obu_comm_feed(); USB and BLE each keep their own
  * instance over their own buffer since the two links reassemble independently. */

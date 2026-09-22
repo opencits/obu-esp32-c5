@@ -18,3 +18,7 @@ comments on public types, variants, fields — describe semantics (format, range
 ## outside files
 May read but **NEVER** change files here:
 - **esp-idf/** - external ESP SDK
+
+## Git Commits
+- terse. subject imperative, ≤72 chars. body only when the *why* isn't obvious — a few lines, not paragraphs.
+- no trailers/footers. never `Co-Authored-By:`, `Claude-Session:`, `Generated with ...`. no emoji.

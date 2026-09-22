@@ -5,6 +5,7 @@ idf_component_register(
         "cmd_tx.c"
         "config.c"
         "events.c"
+        "fw_update.c"
         "led.c"
         "ota.c"
         "spi.c"

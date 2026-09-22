@@ -11,6 +11,7 @@
 #include "freertos/task.h"
 
 #include "config.h"
+#include "fw_update.h"
 #include "obu_wifi.h"
 
 static const char TAG[] = "OBU_COMM";
@@ -374,6 +375,22 @@ void obu_comm_process_frame(uint16_t type, uint16_t length, uint8_t *payload,
             break;
         case COMM_FRAME_TX:
             wifi_tx_frame(payload, length);
+            break;
+
+        case COMM_FRAME_FW_BEGIN:
+            fw_update_begin(payload, length, reply, ctx);
+            break;
+        case COMM_FRAME_FW_DATA:
+            fw_update_data(payload, length, reply, ctx);
+            break;
+        case COMM_FRAME_FW_END:
+            fw_update_end(reply, ctx);
+            break;
+        case COMM_FRAME_FW_ABORT:
+            fw_update_abort(reply, ctx);
+            break;
+        case COMM_FRAME_FW_CONFIRM:
+            fw_update_confirm(reply, ctx);
             break;
 
         default:

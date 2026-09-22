@@ -19,6 +19,7 @@
 
 #include "config.h"
 #include "events.h"
+#include "fw_update.h"
 #include "led.h"
 #include "ota.h"
 #include "spi.h"
@@ -192,6 +193,7 @@ void app_main(void)
     wifi_init();
     sniffer_init();
     ota_init();
+    fw_update_init();
 
     /* Register commands */
     register_sniffer_cmd();
@@ -206,11 +208,19 @@ void app_main(void)
 
     register_tx_cmd();
 
+    register_cca_test_cmd();
+
+    register_cca_stats_cmd();
+
+    register_dccmon_cmd();
+
     usb_stream_init();
     usb_config_rx_start();   /* USB RX config channel for setup wizard */
     bt_stream_init();
 
     wifi_autostart();     /* start WIFI — sets phy_11p_set(1,0) */
+
+    wifi_cca_start();      /* background ETSI DCC channel-busy-ratio measurement */
 
     usb_stream_send_ping();
 

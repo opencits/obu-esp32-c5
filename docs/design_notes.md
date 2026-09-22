@@ -105,9 +105,10 @@ length-prefixed binary framing and share one dispatcher, so the protocol only ne
   power until this is reconciled — use the `tx -p` console command or fix the setter first.
 - `cmd_tx.c`'s `tx` console command transmits a hardcoded sample frame (`SAMPLE_PACKET_HEX`) on a timer
   (`-i <ms>`, default 1000 ms; `--stop` halts it) for bench testing without a connected client. Note the hex
-  blob has a synthetic 14-byte `CommFrameHeader` prefix spliced onto the real captured frame specifically so it
-  passes `wifi_tx_frame`'s length check — don't mistake the first 14 bytes for part of the 802.11 frame when
-  reading/editing that constant.
+  blob has a synthetic 16-byte `CommFrameHeader` prefix spliced onto the real captured frame specifically so it
+  passes `wifi_tx_frame`'s length check — don't mistake the first 16 bytes for part of the 802.11 frame when
+  reading/editing that constant. (Was 14 bytes before `channel`/`rate` widened to `uint16_t`; if `CommFrameHeader`
+  changes size again, `SAMPLE_PACKET_HEX` needs resplicing too or `tx` silently stops transmitting.)
 - Starting `tx` disables the BLE/sniffer coex scheduler (`wifi_coex_disable()`) for the lifetime of the task —
   transmitting and the sniff/BLE duty-cycle below don't run concurrently.
 
@@ -204,16 +205,59 @@ self-test sweep, but nothing updates them afterward — the previously-documente
 (dedicated System/Sniffer/Ethernet/MQTT indicators) is not wired up in this tree; treat `LED_WIFI`/`LED_COMM`/
 `LED_CITS` state variables and their setter functions as currently-unused scaffolding, not a live display mode.
 
-## OTA (`ota.c`)
+## OTA (`ota.c`, `fw_update.c`)
 
-HTTPS OTA (`esp_https_ota`, cert via `esp_crt_bundle`, SPIRAM-backed buffers) into the non-running app partition
-(`esp_ota_get_next_update_partition`). `ota` console command: `-u <url> [-r]` (update, optional reboot), `-C`
-(confirm/cancel rollback), `-R` (force rollback+reboot), `-S` (switch boot partition), `-i` (partition info).
-**Anti-brick safety net**: if the running partition isn't marked `VALID` at boot, a 30-minute one-shot timer
-(`invalidate_and_reboot_timer`) is armed that force-rolls-back if the new firmware never calls `ota -C` to
-confirm itself. `HW_VARIANT` (`Kconfig.projbuild`) is a hardware-compatibility tag intended to gate OTA feeds,
-but it is **not referenced anywhere in firmware C code** — it exists only as a Kconfig value today; any
-enforcement happens outside this codebase (e.g. external OTA-feed tooling), if at all.
+Two independent ways to get a new app image into the non-running OTA partition
+(`esp_ota_get_next_update_partition`) — neither triggers the other:
+
+- **HTTPS pull** (`ota.c`): `esp_https_ota` (cert via `esp_crt_bundle`, SPIRAM-backed buffers), driven by the
+  `ota` console command: `-u <url> [-r]` (update, optional reboot), `-C` (confirm/cancel rollback), `-R` (force
+  rollback+reboot), `-S` (switch boot partition), `-i` (partition info). **Effectively dead in practice**: it
+  needs WiFi STA associated to an AP, and per "Connectivity" below, STA is started at boot but never actually
+  connects in this firmware tree — there is no STA-connect logic to reach a URL with.
+- **Wire-protocol push** (`fw_update.c`): the live path. A connected client (phone/host app) streams the image
+  itself over the same `CommHeader`-framed BLE/USB protocol described above, straight into `esp_ota_write()` —
+  bypassing `esp_https_ota` entirely. New frame types (`obu_comm.h`): `FW_BEGIN`(40)/`FW_DATA`(41)/`FW_END`(42)/
+  `FW_ABORT`(43)/`FW_CONFIRM`(44), replied to with dedicated `FW_ACK`(45)/`FW_NAK`(46) frames (not `CMD_GOOD`/
+  `CMD_FAIL` — those aren't request/response-correlated and could be mis-attributed to an interleaved PING/CONFIG
+  reply mid-transfer).
+  - `FW_BEGIN` payload is `{u32 totalSize}`, network byte order (`htonl`/`ntohl`) — every multi-byte field in
+    this protocol is big-endian, including `CommFrameHeader`'s (`channel`/`rate`/`seconds`/`microseconds` are all
+    `htons`/`htonl`'d in `obu_wifi.c`); rejected if it exceeds the target partition's size. `esp_ota_begin()` erases the target
+    region synchronously and can take several seconds — callers need a long (≥10s) timeout on this one frame,
+    separate from the per-chunk timeout.
+  - `FW_DATA` payload is `{u32 offset}` + raw chunk bytes. `offset` is mandatory: `esp_ota_write` is append-only
+    with no seek, so a lost ack for a chunk the device *did* write must resync via `FW_NAK{bytesWritten}` rather
+    than silently duplicate-write on retry. Any offset mismatch is rejected without writing.
+  - `FW_END` finalizes only if `bytesWritten == totalSize`, then `esp_ota_end()` (validates the image itself) +
+    `esp_ota_set_boot_partition()`. **Does not reboot** — the client sends the existing `COMM_FRAME_CMD_REBOOT`
+    once ready. `FW_ABORT` cancels a transfer in progress (`esp_ota_abort`). A ~15s idle timer auto-aborts a
+    stalled transfer (dropped link, etc.) so the device doesn't sit BLE-frozen/mid-erase indefinitely.
+  - `FW_CONFIRM` calls `ota_confirm_running_partition()` (`ota.h`) — the same
+    `esp_ota_mark_app_valid_cancel_rollback()` + timer-stop logic `ota -C` uses, now shared between the console
+    command and the wire protocol so a post-update client can cancel the anti-brick rollback remotely.
+  - **Radio hand-off**: `fw_update_begin()` calls `wifi_pause()` *then* `wifi_coex_disable()`, in that order —
+    not `wifi_coex_disable()` alone like `cmd_tx.c`. Both `wifi_pause()`/`wifi_resume()` early-return when
+    `!coex_enabled` (see "BLE ⟷ sniffer coexistence" above), so disabling coex while a sniff window happens to be
+    active freezes the radio *promiscuous-on*, starving BLE for the whole transfer — the opposite of what an
+    update needs. Pausing first (while coex is still enabled, so the guard doesn't block it) then disabling coex
+    freezes it paused/BLE-only instead. Released (`wifi_coex_enable()`) on `FW_END`/`FW_ABORT`/idle-timeout.
+    Applied unconditionally (BLE and USB both go through the same `fw_update_begin()`); harmless for USB, which
+    doesn't share the radio, and matches the existing defensive `wifi_coex_disable()` USB config traffic already
+    does in `usb_stream.c`.
+
+**Anti-brick safety net** (shared by both OTA paths): if the running partition isn't marked `VALID` at boot, a
+30-minute one-shot timer (`invalidate_and_reboot_timer`) is armed that force-rolls-back if the new firmware
+never calls `ota -C` / sends `FW_CONFIRM` to confirm itself. **Caveat**: `init_invalidate_and_reboot_timer()`
+only arms this if the *other* partition's last-known state was `ESP_OTA_IMG_VALID` — on a factory-fresh device
+whose second OTA slot was never written, the very first update has no rollback safety net at all. Requires
+`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`/`CONFIG_APP_ROLLBACK_ENABLE` (both `y` in the committed `sdkconfig`) —
+without them `esp_ota_mark_app_valid_cancel_rollback()`/`esp_ota_mark_app_invalid_rollback_and_reboot()` are
+no-ops at the bootloader level.
+
+`HW_VARIANT` (`Kconfig.projbuild`) is a hardware-compatibility tag intended to gate OTA feeds, but it is **not
+referenced anywhere in firmware C code** — it exists only as a Kconfig value today; any enforcement happens
+outside this codebase (e.g. external OTA-feed tooling), if at all. Applies to both OTA paths above.
 
 ## Hardware variants
 

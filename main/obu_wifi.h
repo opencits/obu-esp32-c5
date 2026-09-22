@@ -58,9 +58,34 @@ int8_t wifi_get_txpower(void);
  */
 void wifi_pause(void);
 void wifi_resume(void);
+/* wifi_pause() without the coex_enabled guard. Call after wifi_coex_disable()
+ * so coex_window_task can't resume the radio in between. */
+void wifi_pause_force(void);
 
 void wifi_coex_enable(void);
 void wifi_coex_disable(void);
+
+/* Console cmd probing phy_get_cca_cnt/phy_set_cca_cnt, undocumented libphy.a
+ * symbols reverse-engineered as a possible CCA busy/total counter pair for
+ * ETSI DCC channel-busy-ratio. See `ccatest` command help for usage/caveats.
+ */
+void register_cca_test_cmd(void);
+
+typedef struct {
+  float latest_percent;  // most recent accepted (hardware-valid) 1s window's CBR, 0..100
+  float avg_percent;     // outlier-filtered rolling average over the last few accepted windows
+  uint32_t valid_samples;    // lifetime count of accepted windows
+  uint32_t rejected_samples; // lifetime count of windows discarded (start-pulse miss-fire etc)
+  bool has_data;          // false until the first window is accepted
+} wifi_cca_stats_t;
+
+/* Starts the background CBR measurement task (see docs/esp_dcc_measurements.md
+ * for the hardware validation this is based on). Safe to call once; repeat
+ * calls are no-ops. */
+void wifi_cca_start(void);
+void wifi_get_cca_stats(wifi_cca_stats_t *stats);
+void register_cca_stats_cmd(void); // `ccastats` console command, read-only
+void register_dccmon_cmd(void);    // `dccmon` console command, periodic background printer
 
 #ifdef __cplusplus
 }

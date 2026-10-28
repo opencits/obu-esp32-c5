@@ -131,6 +131,18 @@ miss-fire" already documented, not something new. Confirms the practical
 guidance above: a real DCC polling loop must detect a stale/repeated
 `total` and re-arm, not trust every read as a fresh window.
 
+## Own TX is not counted as busy
+
+Re-tested once the TX loop paced correctly (`cmd_tx.cpp` TX loop: `-i 10 -b 2 -l 1300`, 200.0 fps × 1334 B ≈
+36% expected airtime at 6 Mbit/s): CBR stayed 0.00–0.11% (`latest` 0.00%) while valid windows kept completing
+(valid 119→125) — so not a stale average. `busy` most likely comes from the RX chain, which is blanked during own
+TX (my reading, not documented). No public TX-airtime counter in `libphy`/`libpp`/`libnet80211` (`nm`; only
+internal `lmac_record_txtime`, semantics unknown). Not yet confirmed on air by a second receiver.
+
+**Possible improvement (not implemented):** firmware knows every frame it sends (length, rate) — sum own airtime
+(preamble + PLCP + bits/rate) per CBR window and report it, ideally as a separate `ownTxPercent`, rather than
+folding it into the measured `busy`. Whether ETSI TS 102 687 CBR should include own TX: not checked.
+
 ## Bugs found and fixed along the way (unrelated to CCA itself)
 
 - **`cmd_tx.cpp`'s `SAMPLE_PACKET_HEX` was stale since commit `8c20558`
@@ -141,8 +153,8 @@ guidance above: a real DCC polling loop must detect a stale/repeated
   frame ever went over the air. Fixed: resplice to the 16-byte layout
   (`channel=0`, `rate=0` → use current defaults, `frameLen=121`). Also fixed
   the matching stale "14-byte" description in `docs/design_notes.md`.
-- **`cmd_tx.cpp`'s `tx_task` 100ms polling floor** (described above) — found,
-  not fixed.
+- **`cmd_tx.cpp`'s `tx_task` 100ms polling floor** (described above) — since fixed: the TX loop
+  now paces with `vTaskDelayUntil` (10 ms tick granularity).
 
 ## Production code: background measurement task + console tools
 
@@ -164,6 +176,17 @@ gapped/interactive manual tests) — re-arming immediately after a freeze
 seems to miss-fire more than re-arming after a short pause. Harmless
 (rejected samples are correctly excluded from `avg_percent`), just means
 real-world throughput is closer to 1 valid window per ~2s than per ~1.1s.
+
+**Hypothesis (unverified on C5): baseband reset restarts/aborts the window.** `ermacv/open-esp-radio`
+(`chips/esp32s31/notes/phy/cca-counter.md`, ESP32-S31 — same 3-register CCA block at `0x20107c58`) found that
+releasing `MODEM_SYSCON.MODEM_RST_CONF.RST_WIFIBB` restarts the counter window, and the vendor driver does that on
+the PM wake path inside `esp_wifi_set_promiscuous(true)` (`pm_wake_up` → `modem_clock_wifi_bb_configure(true)`).
+Our coex cycle runs `esp_wifi_stop()`/`esp_wifi_start()`/`set_promiscuous(true)` per sniff/BLE window
+(`WifiController::pause()`/`resume()`), so a window spanning a pause/resume could be reset or never reach the
+ceiling → rejected. Counter-evidence: rejects stayed ~1 per valid window both idle (no client: pause/resume only
+every ~12 s, 10000/2000 ms cycle) and during the TX loop (coex frozen, no pause/resume: +6 valid / +11 rejected
+in ~16 s) — so this explains at most part of the rejects. Test: log rejects per window with timestamps of
+`pause()`/`resume()`, or arm windows only after `resume()`.
 
 Console tools (read-only, for bench use): `ccastats` (one-shot dump),
 `dccmon -i <ms> / --stop` (periodic `fprintf` printer — note: uses `fprintf`,

@@ -1,23 +1,18 @@
 #include "sdkconfig.h"
 
-#include <stdatomic.h>
-#include <string.h>
-#include <stdlib.h>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
 #include <sys/time.h>
 #include <sys/unistd.h>
 #include <sys/fcntl.h>
 
 #include "argtable3/argtable3.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/queue.h"
-#include "freertos/semphr.h"
 #include "esp_private/wifi_os_adapter.h"
 #include "esp_app_trace.h"
 #include "esp_check.h"
 #include "esp_console.h"
 #include "esp_log.h"
-#include "esp_wifi.h"
 #include "nvs.h"
 
 #include "pcap.h"
@@ -38,28 +33,6 @@
 #define WIFI_HW_CHANNEL                  (140)
 
 static const char TAG[] = "wifi";
-
-static bool is_running;
-/* Outstanding wifi_coex_hold()s (USB rx, tx task, FW update). While >0,
- * wifi_pause()/wifi_resume() no-op, so coex_window_task can't move the radio. */
-static atomic_int coex_holds;
-
-static uint16_t channel;     // in MHZ : CCH
-static uint32_t filter;
-static bool wifi_paused;
-static uint16_t tx_datarate = 6000; // in kbps: 6000
-static int8_t tx_power = -1;
-static bool tx_loopback = false;
-
-static wifi_stats_t wifi_stats;
-
-static TaskHandle_t task;
-static QueueHandle_t work_queue;
-static SemaphoreHandle_t sem_task_over;
-
-// the PHY hooks to enable 802.11p functionality
-void phy_change_channel(int,int,int,int);
-void phy_11p_set(int,int);
 
 /* phy_get_cca_cnt/phy_set_cca_cnt: undocumented libphy.a symbols, no caller
  * anywhere in esp-idf to confirm against. Reverse-engineered from esp32c5
@@ -86,8 +59,23 @@ typedef struct {
     uint32_t total; // elapsed PHY clock cycles since last (re)start, ~40MHz, caps at 0x07FFFFFF
     uint32_t busy;  // CCA-busy cycles accumulated over the same window
 } phy_cca_cnt_t;
+
+// Closed-source blob symbols (libphy.a / libnet80211.a): C linkage.
+extern "C" {
+// the PHY hooks to enable 802.11p functionality
+void phy_change_channel(int, int, int, int);
+void phy_11p_set(int, int);
+
 void phy_set_cca_cnt(uint32_t value, int onOff);
 bool phy_get_cca_cnt(phy_cca_cnt_t *out);
+
+esp_err_t ieee80211_post_hmac_tx(void *ebuf);
+void *ic_ebuf_alloc(const void *packet, uint32_t unknown, uint32_t len);
+void *ic_get_default_sched(void);
+
+extern wifi_osi_funcs_t *g_osi_funcs_p;
+extern void *g_wifi_global_lock;
+}
 
 // raw MMIO addresses backing the above, for cross-checking the guessed struct
 // layout independent of phy_get_cca_cnt's own masking/shifting.
@@ -95,7 +83,11 @@ bool phy_get_cca_cnt(phy_cca_cnt_t *out);
 #define PHY_CCA_CNT_A_REG  (*(volatile uint32_t *)0x600A7C5C)
 #define PHY_CCA_CNT_B_REG  (*(volatile uint32_t *)0x600A7C60)
 
-static int datarateKbpsToCode(uint16_t rate)
+constinit WifiController WifiController::s_instance;
+
+namespace {
+
+wifi_phy_rate_t datarateKbpsToCode(uint16_t rate)
 {
     switch (rate)
     {
@@ -122,7 +114,7 @@ static int datarateKbpsToCode(uint16_t rate)
     return WIFI_PHY_RATE_12M; // return default rate (6Mbps)
 }
 
-static uint16_t datarateCodeToKbps(int rate)
+uint16_t datarateCodeToKbps(int rate)
 {
     switch (rate)
     {
@@ -148,7 +140,7 @@ static uint16_t datarateCodeToKbps(int rate)
     return 6000; // return default rate (6Mbps)
 }
 
-static bool check_valid_channel(uint16_t chan)
+bool checkValidChannel(uint16_t chan)
 {
     switch (chan)
     {
@@ -166,20 +158,24 @@ static bool check_valid_channel(uint16_t chan)
     return false;
 }
 
-static void queue_packet(const void *recv_packet, uint16_t len, const CommFrameHeader *packet_info)
+} // namespace
+
+// ================================ SNIFFER =================================
+
+void WifiController::queuePacket(const void *data, uint16_t len, const CommFrameHeader *info)
 {
     wifi_packet_t packet;
     /* Copy a packet from Link Layer driver and queue the copy to be processed by sniffer task */
-    packet.payload = malloc(sizeof(CommFrameHeader) + len);
+    packet.payload = static_cast<uint8_t *>(malloc(sizeof(CommFrameHeader) + len));
     if (packet.payload)
     {
         packet.length = sizeof(CommFrameHeader) + len;
-        memcpy(packet.payload, packet_info, sizeof(CommFrameHeader));
-        memcpy(packet.payload + sizeof(CommFrameHeader), recv_packet, len);
-        if (work_queue)
+        memcpy(packet.payload, info, sizeof(CommFrameHeader));
+        memcpy(packet.payload + sizeof(CommFrameHeader), data, len);
+        if (workQueue_)
         {
             /* send packet_info */
-            if (xQueueSend(work_queue, &packet, pdMS_TO_TICKS(WIFI_PROCESS_PACKET_TIMEOUT_MS)) == pdTRUE)
+            if (xQueueSend(workQueue_, &packet, pdMS_TO_TICKS(WIFI_PROCESS_PACKET_TIMEOUT_MS)) == pdTRUE)
             {
                 return;
             }
@@ -195,14 +191,15 @@ static void queue_packet(const void *recv_packet, uint16_t len, const CommFrameH
     {
         ESP_LOGE(TAG, "No enough memory for promiscuous packet");
     }
-    wifi_stats.rxErr++;
+    stats_.rxErr++;
 }
 
-static void wifi_receive_cb(void *recv_buf, wifi_promiscuous_pkt_type_t type)
+void WifiController::rxCallback(void *recvBuf, wifi_promiscuous_pkt_type_t type)
 {
+    WifiController &self = instance();
     CommFrameHeader packet_info;
     uint16_t payloadLen;
-    wifi_promiscuous_pkt_t *packet = (wifi_promiscuous_pkt_t *)recv_buf;
+    auto *packet = static_cast<wifi_promiscuous_pkt_t *>(recvBuf);
 
     /* prepare packet_info */
     packet_info.seconds = htonl(packet->rx_ctrl.timestamp / 1000000U);
@@ -211,11 +208,11 @@ static void wifi_receive_cb(void *recv_buf, wifi_promiscuous_pkt_type_t type)
     packet_info.noise = (int8_t)packet->rx_ctrl.noise_floor;
 
     // donot use the rx_ctrl channel
-    // this is the MAC channel used in wifi_resume,
+    // this is the MAC channel used in resume(),
     // --> esp_wifi_set_channel(WIFI_HW_CHANNEL, WIFI_SECOND_CHAN_NONE);
     // then overwritten by
     // --> phy_change_channel(channel, 1, 0, 0);
-    packet_info.channel = htons(channel);
+    packet_info.channel = htons(self.channel_);
 
     // convert to datarate in kbps
     packet_info.rate = htons(datarateCodeToKbps(packet->rx_ctrl.rate));
@@ -225,14 +222,12 @@ static void wifi_receive_cb(void *recv_buf, wifi_promiscuous_pkt_type_t type)
     /* For now, the sniffer only dumps the length of the MISC type frame */
     if (type != WIFI_PKT_MISC && !packet->rx_ctrl.rx_state)
     {
-        queue_packet(packet->payload, payloadLen, &packet_info);
+        self.queuePacket(packet->payload, payloadLen, &packet_info);
     }
 }
 
-static void wifi_loopback(const uint8_t* payload,
-                        uint16_t payloadLen,
-                        uint16_t chan,
-                        uint16_t rate) {
+void WifiController::loopback(const uint8_t *payload, uint16_t len, uint16_t chan, uint16_t rate)
+{
     struct timespec tp;
     clock_gettime(CLOCK_REALTIME, &tp);
 
@@ -243,214 +238,217 @@ static void wifi_loopback(const uint8_t* payload,
     packet_info.rate = htons(rate);
     packet_info.rssi_power = 0;
     packet_info.noise = 0;
-    packet_info.frameLen = htons(payloadLen);
+    packet_info.frameLen = htons(len);
 
-    queue_packet(payload, payloadLen, &packet_info);
+    queuePacket(payload, len, &packet_info);
 }
 
-static void wifi_task(void *)
+void WifiController::sniffTaskEntry(void *arg)
+{
+    static_cast<WifiController *>(arg)->sniffTask();
+}
+
+void WifiController::sniffTask()
 {
     wifi_packet_t packet;
-    while (is_running)
+    while (running_)
     {
         /* receive packet info from queue */
-        if (xQueueReceive(work_queue, &packet, pdMS_TO_TICKS(WIFI_PROCESS_PACKET_TIMEOUT_MS)) != pdTRUE)
+        if (xQueueReceive(workQueue_, &packet, pdMS_TO_TICKS(WIFI_PROCESS_PACKET_TIMEOUT_MS)) != pdTRUE)
         {
             continue;
         }
-        wifi_stats.rx++;
-        
-        if (obu_comm_usb_connected()) usb_stream_publish_packet(&packet);
-        if (obu_comm_ble_connected()) bt_stream_publish_packet(&packet);
-        
+        stats_.rx++;
+
+        if (obu_comm_usb_connected()) UsbStream::instance().publishPacket(&packet);
+        if (obu_comm_ble_connected()) BtStream::instance().publishPacket(&packet);
+
         esp_event_post(WIFI_EVENT_BASE, WIFI_RECEIVED_PACKET, NULL, 0, 0);
         ESP_LOGI(TAG, "RX: %d bytes", packet.length);
         free(packet.payload);
     }
     /* notify that sniffer task is over */
-    xSemaphoreGive(sem_task_over);
+    xSemaphoreGive(semTaskOver_);
     vTaskDelete(NULL);
 }
 
-int wifi_stop(void)
+esp_err_t WifiController::stop()
 {
-    esp_err_t ret = ESP_OK;
-
-    ESP_GOTO_ON_FALSE(is_running, ESP_ERR_INVALID_STATE, err, TAG, "WiFi is already stopped");
+    ESP_RETURN_ON_FALSE(running_, ESP_ERR_INVALID_STATE, TAG, "WiFi is already stopped");
     /* Disable wifi promiscuous mode */
-    ESP_GOTO_ON_ERROR(esp_wifi_set_promiscuous(false), err, TAG, "stop WiFi promiscuous failed");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_promiscuous(false), TAG, "stop WiFi promiscuous failed");
 
     ESP_LOGI(TAG, "stop WiFi promiscuous ok");
     /* stop WiFi local task */
-    is_running = false;
+    running_ = false;
     /* wait for task over */
-    xSemaphoreTake(sem_task_over, portMAX_DELAY);
+    xSemaphoreTake(semTaskOver_, portMAX_DELAY);
 
     /* make sure to free all resources in the left items */
-    UBaseType_t left_items = uxQueueMessagesWaiting(work_queue);
+    UBaseType_t left_items = uxQueueMessagesWaiting(workQueue_);
 
     wifi_packet_t packet_info;
     while (left_items--)
     {
-        xQueueReceive(work_queue, &packet_info, pdMS_TO_TICKS(WIFI_PROCESS_PACKET_TIMEOUT_MS));
+        xQueueReceive(workQueue_, &packet_info, pdMS_TO_TICKS(WIFI_PROCESS_PACKET_TIMEOUT_MS));
         free(packet_info.payload);
     }
     esp_event_post(WIFI_EVENT_BASE, WIFI_STOPPED, NULL, 0, 0);
-err:
-    return ret;
+    return ESP_OK;
 }
 
-int wifi_start(void)
+esp_err_t WifiController::tuneRadio()
 {
-    esp_err_t ret = ESP_OK;
-    wifi_promiscuous_filter_t wifi_filter;
-
-    ESP_GOTO_ON_FALSE(!is_running, ESP_ERR_INVALID_STATE, err, TAG, "sniffer is already running");
-
-    is_running = true;
-    ESP_GOTO_ON_FALSE(xTaskCreate(wifi_task,
-        "tWifi",
-        CONFIG_SNIFFER_TASK_STACK_SIZE,
-        NULL,
-        CONFIG_SNIFFER_TASK_PRIORITY,
-        &task), ESP_FAIL, err_task, TAG, "create task failed");
-
     /* Start WiFi Promiscuous Mode */
-    wifi_filter.filter_mask = filter;
+    wifi_promiscuous_filter_t wifi_filter = { .filter_mask = filter_ };
     esp_wifi_set_promiscuous_filter(&wifi_filter);
-    esp_wifi_set_promiscuous_rx_cb(wifi_receive_cb);
-    ESP_GOTO_ON_ERROR(esp_wifi_set_promiscuous(true), err_start, TAG, "set promis failed");
-    //ESP_GOTO_ON_ERROR(esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE), err_start, TAG, "set channel failed");
+    esp_wifi_set_promiscuous_rx_cb(&WifiController::rxCallback);
+    ESP_RETURN_ON_ERROR(esp_wifi_set_promiscuous(true), TAG, "set promis failed");
+    //ESP_RETURN_ON_ERROR(esp_wifi_set_channel(channel_, WIFI_SECOND_CHAN_NONE), TAG, "set channel failed");
     // enable 802.11p mode (enable, unknown (must be 0))
     phy_11p_set(1, 0);
     // set a channel with a frequency close to our desired frequency (not sure if strictly needed)
-    ESP_GOTO_ON_ERROR(esp_wifi_set_channel(WIFI_HW_CHANNEL, WIFI_SECOND_CHAN_NONE), err_start, TAG, "set channel failed");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_channel(WIFI_HW_CHANNEL, WIFI_SECOND_CHAN_NONE), TAG, "set channel failed");
     // switch channel (channel, ignored, ignored, ht_mode?)
-    phy_change_channel(channel, 1, 0, 0);
+    phy_change_channel(channel_, 1, 0, 0);
+    return ESP_OK;
+}
+
+esp_err_t WifiController::start()
+{
+    ESP_RETURN_ON_FALSE(!running_, ESP_ERR_INVALID_STATE, TAG, "sniffer is already running");
+
+    running_ = true;
+    if (xTaskCreate(&WifiController::sniffTaskEntry,
+        "tWifi",
+        CONFIG_SNIFFER_TASK_STACK_SIZE,
+        this,
+        CONFIG_SNIFFER_TASK_PRIORITY,
+        &task_) != pdPASS)
+    {
+        running_ = false;
+        ESP_LOGE(TAG, "create task failed");
+        return ESP_FAIL;
+    }
+
+    esp_err_t ret = tuneRadio();
+    if (ret != ESP_OK)
+    {
+        // task was already started, need to shut it down gracefully
+        running_ = false;
+        xSemaphoreTake(semTaskOver_, portMAX_DELAY);
+        task_ = nullptr;
+        return ret;
+    }
 
     uint8_t loop;
     if (config_get_u8(CONFIG_INDEX_WIFI_LOOP, &loop) == ESP_OK) {
-        tx_loopback = (loop != 0);
+        txLoopback_ = (loop != 0);
     }
 
     ESP_LOGI(TAG, "start WiFi promiscuous ok");
     esp_event_post(WIFI_EVENT_BASE, WIFI_STARTED, NULL, 0, 0);
-    return ret;
-
-err_start:
-    // task was already started, need to shut it down gracefully
-    is_running = false;
-    xSemaphoreTake(sem_task_over, portMAX_DELAY);
-    task = NULL;
-    err_task:
-        is_running = false;
-    err:
-        return ret;
+    return ESP_OK;
 }
 
-void wifi_autostart(void)
+void WifiController::autostart()
 {
     uint32_t conf_channel = 5900;
     esp_err_t ret = config_get_u32(CONFIG_INDEX_AUTOSTART_CHAN, &conf_channel);
     if (ret != ESP_OK)
     {
         if (ret != ESP_ERR_NVS_NOT_FOUND)
-        ESP_LOGE(TAG, "autostart: config_get_u32 failed: %s", ret);
+        ESP_LOGE(TAG, "autostart: config_get_u32 failed: %s", esp_err_to_name(ret));
         return;
     }
-    if (!check_valid_channel(conf_channel))
+    if (!checkValidChannel(conf_channel))
     {
-        ESP_LOGE(TAG, "autostart: conf_channel invalid: %u", conf_channel);
+        ESP_LOGE(TAG, "autostart: conf_channel invalid: %u", (unsigned)conf_channel);
         return;
     }
 
-    channel = conf_channel;
-    filter = WIFI_PROMIS_FILTER_MASK_ALL & ~WIFI_PROMIS_FILTER_MASK_FCSFAIL;
-    wifi_start();
+    channel_ = conf_channel;
+    filter_ = WIFI_PROMIS_FILTER_MASK_ALL & ~WIFI_PROMIS_FILTER_MASK_FCSFAIL;
+    start();
 }
 
-void wifi_pause(void)
+void WifiController::pause()
 {
-  if (atomic_load(&coex_holds) > 0) return;
-  wifi_pause_force();
+  if (coexHolds_.load() > 0) return;
+  pauseForce();
 }
 
-void wifi_pause_force(void)
+void WifiController::pauseForce()
 {
-  if (wifi_paused) return;
+  if (paused_) return;
 
   ESP_LOGI(TAG, "pause WiFi");
   esp_wifi_set_promiscuous(false);
   phy_11p_set(0, 0);
   esp_wifi_stop();
-  wifi_paused = true;
+  paused_ = true;
 }
 
-void wifi_resume(void)
+void WifiController::resume()
 {
-  if (!wifi_paused) return;
-  if (atomic_load(&coex_holds) > 0) return;
+  if (coexHolds_.load() > 0) return;
+  resumeForce();
+}
+
+void WifiController::resumeForce()
+{
+  if (!paused_) return;
 
   ESP_LOGI(TAG, "resume WiFi");
   esp_wifi_start();
-  wifi_promiscuous_filter_t wifi_filter = { .filter_mask = filter };
+  wifi_promiscuous_filter_t wifi_filter = { .filter_mask = filter_ };
   esp_wifi_set_promiscuous_filter(&wifi_filter);
   esp_wifi_set_promiscuous(true);
   phy_11p_set(1, 0);
   esp_wifi_set_channel(WIFI_HW_CHANNEL, WIFI_SECOND_CHAN_NONE);
-  phy_change_channel(channel, 1, 0, 0);
-  wifi_paused = false;
+  phy_change_channel(channel_, 1, 0, 0);
+  paused_ = false;
 }
 
-void wifi_coex_hold(void)
+void WifiController::coexRelease()
 {
-    atomic_fetch_add(&coex_holds, 1);
-}
-
-void wifi_coex_release(void)
-{
-    int n = atomic_load(&coex_holds);
+    int n = coexHolds_.load();
     do {
         if (n <= 0) {
-            ESP_LOGE(TAG, "wifi_coex_release without matching hold");
+            ESP_LOGE(TAG, "coexRelease without matching hold");
             return;
         }
-    } while (!atomic_compare_exchange_weak(&coex_holds, &n, n - 1));
+    } while (!coexHolds_.compare_exchange_weak(n, n - 1));
 }
 
-void wifi_init(void)
+void WifiController::init()
 {
-  esp_err_t ret = ESP_OK;
+  semTaskOver_ = xSemaphoreCreateBinary();
+  if (!semTaskOver_)
+  {
+      ESP_LOGE(TAG, "create semaphore failed");
+      ESP_ERROR_CHECK(ESP_FAIL);
+  }
 
-  sem_task_over = xSemaphoreCreateBinary();
-  ESP_GOTO_ON_FALSE(sem_task_over, ESP_FAIL, err, TAG, "create semaphore failed");
-
-  work_queue = xQueueCreate(CONFIG_SNIFFER_WORK_QUEUE_LEN, sizeof(wifi_packet_t));
-  ESP_GOTO_ON_FALSE(work_queue, ESP_FAIL, err, TAG, "create work queue failed");
-
-  err:
-      ESP_ERROR_CHECK(ret);
+  workQueue_ = xQueueCreate(CONFIG_SNIFFER_WORK_QUEUE_LEN, sizeof(wifi_packet_t));
+  if (!workQueue_)
+  {
+      ESP_LOGE(TAG, "create work queue failed");
+      ESP_ERROR_CHECK(ESP_FAIL);
+  }
 }
 
-void wifi_get_stats(wifi_stats_t *stats)
+void WifiController::setChannel(uint16_t chan)
 {
-    memcpy(stats, &wifi_stats, sizeof(wifi_stats_t));
-}
-
-void wifi_set_channel(uint16_t chan)
-{
-    if (!check_valid_channel(chan))
+    if (!checkValidChannel(chan))
     {
         ESP_LOGE(TAG, "Invalid channel value: %u", chan);
         return;
     }
-    channel = chan;
+    channel_ = chan;
 }
-void wifi_set_filter(uint32_t filt)
-{
-    filter = filt;
-}
-void wifi_set_txpower(int powerDbm)
+
+void WifiController::setTxPower(int powerDbm)
 {
     int8_t power = powerDbm * 4;
     if (power < 8 || power > 80)
@@ -458,7 +456,7 @@ void wifi_set_txpower(int powerDbm)
         ESP_LOGE(TAG, "Invalid tx power value: %d (2..20)", powerDbm);
         return;
     }
-    while (wifi_paused)
+    while (paused_)
     {
         vTaskDelay(pdMS_TO_TICKS(100));
     }
@@ -466,64 +464,40 @@ void wifi_set_txpower(int powerDbm)
     if (ret != ESP_OK)
     {
         ESP_LOGE(TAG, "esp_wifi_set_max_tx_power failed: %s", esp_err_to_name(ret));
-        tx_power = -1;
+        txPower_ = -1;
     }
     else
     {
-        tx_power = power / 4;
+        txPower_ = power / 4;
     }
 }
 
-uint32_t wifi_get_channel(void)
+int8_t WifiController::txPower()
 {
-    return channel;
-}
-uint32_t wifi_get_filter(void)
-{
-    return filter;
-}
-
-int8_t wifi_get_txpower(void)
-{
-    if (tx_power < 0)
+    if (txPower_ < 0)
     {
-        while (wifi_paused)
+        while (paused_)
         {
             vTaskDelay(pdMS_TO_TICKS(100));
         }
-        esp_err_t ret = esp_wifi_get_max_tx_power(&tx_power);
+        esp_err_t ret = esp_wifi_get_max_tx_power(&txPower_);
         if (ret != ESP_OK)
         {
-            tx_power = -1;
+            txPower_ = -1;
             ESP_LOGE(TAG, "Failed read TX power: %s", esp_err_to_name(ret));
         }
         else
         {
-            tx_power = tx_power / 4;
+            txPower_ = txPower_ / 4;
         }
     }
-    return tx_power;
-}
-
-void wifi_set_datarate(uint16_t datarate)
-{
-    tx_datarate = datarate;
-}
-void wifi_set_loop(uint8_t onOff)
-{
-    tx_loopback = (onOff != 0);
+    return txPower_;
 }
 
 
 // ================================ TRANSMITTER =============================
 
-esp_err_t ieee80211_raw_frame_sanity_check(wifi_interface_t ifx, const void *buffer, int32_t len, bool en_sys_seq);
-esp_err_t ieee80211_post_hmac_tx(void *ebuf);
-void *ic_ebuf_alloc(const void *packet, uint32_t unknown, uint32_t len);
-void *ic_get_default_sched(void);
-
-extern wifi_osi_funcs_t *g_osi_funcs_p;
-extern void *g_wifi_global_lock;
+namespace {
 
 typedef struct x_eb_txdesc
 {
@@ -613,9 +587,9 @@ esp_err_t esp_wifi_80211_tx_custom(wifi_interface_t ifx,
     wifi_band_t band,
     wifi_bandwidth_t bw)
 {
-    int result = ESP_OK;
+    esp_err_t result = ESP_OK;
     g_osi_funcs_p->_mutex_lock(g_wifi_global_lock);
-    x_ebuf_t* eb = ic_ebuf_alloc(buffer, 1, len);
+    auto *eb = static_cast<x_ebuf_t *>(ic_ebuf_alloc(buffer, 1, len));
     if (eb)
     {
         //eb->data_length = len - 0x1a;
@@ -672,75 +646,264 @@ esp_err_t esp_wifi_80211_tx_custom(wifi_interface_t ifx,
     return result;
 }
 
-wifi_tx_rate_config_t tx_rate_config =
-{
-    .phymode = WIFI_PHY_MODE_11A,
-    .rate = WIFI_PHY_RATE_6M,
-    .ersu = false,
-    .dcm = false
-};
+} // namespace
 
-void wifi_tx_frame(uint8_t *payload, uint16_t length)
+void WifiController::txFrame(uint8_t *payload, uint16_t length)
 {
     if (length < sizeof(CommFrameHeader))
     {
         ESP_LOGW(TAG, "frame too short for header: %d < %d", length, (int)sizeof(CommFrameHeader));
-        wifi_stats.txErr++;
+        stats_.txErr++;
         return;
     }
 
-    const CommFrameHeader* hdr = (CommFrameHeader *)payload;
+    const auto *hdr = reinterpret_cast<const CommFrameHeader *>(payload);
     payload += sizeof(CommFrameHeader);
     length -= sizeof(CommFrameHeader);
 
     if (ntohs(hdr->frameLen) != length)
     {
         ESP_LOGW(TAG, "frame length mismatch: %d != %d", ntohs(hdr->frameLen), length);
-        wifi_stats.txErr++;
+        stats_.txErr++;
         return;
     }
 
     // allow channel in header as zero -> use default channel
     // yet when provided must match currently tuned channel
     uint16_t chan = ntohs(hdr->channel);
-    if (chan != 0 && chan != channel)
+    if (chan != 0 && chan != channel_)
     {
         ESP_LOGW(TAG, "invalid channel: %u", chan);
-        wifi_stats.txErr++;
+        stats_.txErr++;
         return;
     }
-    chan = channel;
+    chan = channel_;
 
     // allow rate in header as zero -> use default rate
     uint16_t rate = ntohs(hdr->rate);
     if (rate == 0)
     {
-        rate = tx_datarate;
+        rate = txDatarate_;
     }
-    tx_rate_config.rate = datarateKbpsToCode(rate);
+    txRateConfig_.rate = datarateKbpsToCode(rate);
 
     esp_err_t rc = esp_wifi_80211_tx_custom(WIFI_IF_STA,
         payload,
         length,
         false,
-        &tx_rate_config,
+        &txRateConfig_,
         WIFI_BAND_5G,
         WIFI_BW20);
 
     if (rc != ESP_OK)
     {
-        wifi_stats.txErr++;
+        stats_.txErr++;
         ESP_LOGW(TAG, "frame tx failed: %s", esp_err_to_name(rc));
     }
     else
     {
-        wifi_stats.tx++;
+        stats_.tx++;
         esp_event_post(WIFI_EVENT_BASE, WIFI_TRANSMIT_PACKET, NULL, 0, 0);
         ESP_LOGD(TAG, "TX: %d bytes", length);
-        if (tx_loopback)
+        if (txLoopback_)
         {
-            wifi_loopback(payload, length, chan, rate);
+            loopback(payload, length, chan, rate);
         }
+    }
+}
+
+bool WifiController::txFrameRaw(uint8_t *payload, uint16_t length)
+{
+    // txRateConfig_ is otherwise only refreshed per header in txFrame()
+    txRateConfig_.rate = datarateKbpsToCode(txDatarate_);
+    esp_err_t rc = esp_wifi_80211_tx_custom(WIFI_IF_STA,
+        payload,
+        length,
+        false,
+        &txRateConfig_,
+        WIFI_BAND_5G,
+        WIFI_BW20);
+    if (rc != ESP_OK)
+    {
+        stats_.txErr++;
+        return false;
+    }
+    stats_.tx++;
+    esp_event_post(WIFI_EVENT_BASE, WIFI_TRANSMIT_PACKET, NULL, 0, 0);
+    return true;
+}
+
+// ============================ CCA/DCC MEASUREMENT (background) ============
+// Continuous ETSI ITS-G5 DCC channel-busy-ratio measurement, built on the
+// hardware validation in docs/esp_dcc_measurements.md (confirmed against a
+// reference load generator across idle/~5%/~10%/~45% channel load).
+
+#define CCA_WINDOW_CYCLES     40000000u // ~1s at the confirmed ~39.8MHz tick rate
+#define CCA_WINDOW_WAIT_MS    1100      // window + margin: ~39.8MHz needs ~1005ms to reach the ceiling
+#define CCA_OUTLIER_LOW_FRAC  0.5f      // drop samples below this fraction of the median: low dropouts were observed whenever a window landed in a gap of the reference generator's duty cycle, never a high spike (high spikes are the separate busy>total race, clamped below, not filtered here)
+#define CCA_TASK_STACK        3072
+#define CCA_TASK_PRIORITY     3
+
+/* Mean of the history, excluding samples below CCA_OUTLIER_LOW_FRAC * median.
+ * Falls back to the plain mean if that excludes everything (shouldn't happen:
+ * the median itself always qualifies). Caller holds ccaMutex_. */
+float WifiController::ccaFilteredAverage() const
+{
+    float sorted[CCA_HISTORY_LEN];
+    memcpy(sorted, ccaHistory_, ccaHistoryCount_ * sizeof(float));
+    qsort(sorted, ccaHistoryCount_, sizeof(float), [](const void *a, const void *b) {
+        float fa = *static_cast<const float *>(a), fb = *static_cast<const float *>(b);
+        return (fa > fb) - (fa < fb);
+    });
+    float median = sorted[ccaHistoryCount_ / 2];
+    float threshold = median * CCA_OUTLIER_LOW_FRAC;
+
+    float sum = 0;
+    int n = 0;
+    for (int i = 0; i < ccaHistoryCount_; i++)
+    {
+        if (ccaHistory_[i] >= threshold)
+        {
+            sum += ccaHistory_[i];
+            n++;
+        }
+    }
+    if (n == 0)
+    {
+        for (int i = 0; i < ccaHistoryCount_; i++) sum += ccaHistory_[i];
+        n = ccaHistoryCount_;
+    }
+    return sum / n;
+}
+
+void WifiController::ccaTaskEntry(void *arg)
+{
+    static_cast<WifiController *>(arg)->ccaTask();
+}
+
+void WifiController::ccaTask()
+{
+    uint32_t last_total = 0, last_busy = 0;
+    bool have_last = false;
+
+    for (;;)
+    {
+        phy_set_cca_cnt(CCA_WINDOW_CYCLES, 1);
+        vTaskDelay(pdMS_TO_TICKS(CCA_WINDOW_WAIT_MS));
+
+        phy_cca_cnt_t raw;
+        bool flag = phy_get_cca_cnt(&raw);
+
+        /* A genuinely completed window always reports exactly the configured
+         * ceiling. Anything else — never started, or a stale re-read of an
+         * earlier window after a start-pulse miss-fire (see
+         * docs/esp_dcc_measurements.md) — is discarded, not averaged. */
+        bool duplicate = have_last && raw.total == last_total && raw.busy == last_busy;
+        bool valid = flag && raw.total == CCA_WINDOW_CYCLES && !duplicate;
+
+        last_total = raw.total;
+        last_busy = raw.busy;
+        have_last = true;
+
+        if (!valid)
+        {
+            xSemaphoreTake(ccaMutex_, portMAX_DELAY);
+            ccaStats_.rejected_samples++;
+            xSemaphoreGive(ccaMutex_);
+            continue;
+        }
+
+        uint32_t busy = raw.busy > raw.total ? raw.total : raw.busy; // busy>total race, see doc
+        float percent = 100.0f * (float)busy / (float)raw.total;
+
+        xSemaphoreTake(ccaMutex_, portMAX_DELAY);
+        ccaHistory_[ccaHistoryNext_] = percent;
+        ccaHistoryNext_ = (ccaHistoryNext_ + 1) % CCA_HISTORY_LEN;
+        if (ccaHistoryCount_ < CCA_HISTORY_LEN) ccaHistoryCount_++;
+
+        ccaStats_.latest_percent = percent;
+        ccaStats_.avg_percent = ccaFilteredAverage();
+        ccaStats_.valid_samples++;
+        ccaStats_.has_data = true;
+        xSemaphoreGive(ccaMutex_);
+    }
+}
+
+void WifiController::ccaStart()
+{
+    if (ccaTask_) return;
+
+    ccaMutex_ = xSemaphoreCreateMutex();
+    if (!ccaMutex_)
+    {
+        ESP_LOGE(TAG, "cca: create mutex failed");
+        return;
+    }
+    if (xTaskCreate(&WifiController::ccaTaskEntry, "tCca", CCA_TASK_STACK, this, CCA_TASK_PRIORITY, &ccaTask_) != pdTRUE)
+    {
+        ESP_LOGE(TAG, "cca: create task failed");
+        ccaTask_ = nullptr;
+    }
+}
+
+wifi_cca_stats_t WifiController::ccaStats()
+{
+    if (!ccaMutex_)
+    {
+        return {};
+    }
+    xSemaphoreTake(ccaMutex_, portMAX_DELAY);
+    wifi_cca_stats_t stats = ccaStats_;
+    xSemaphoreGive(ccaMutex_);
+    return stats;
+}
+
+// ============================ CBR_IND (wire protocol push) =================
+// Same data as `dccmon`, pushed as COMM_FRAME_CBR_IND over USB/BLE (whichever
+// is connected) instead of printed — gated by COMM_FRAME_CMD_CBR_START/STOP
+// (obu_comm.cpp). Mirrors sniffTask's existing dual-publish-if-connected pattern.
+
+void WifiController::cbrIndPublish()
+{
+    wifi_cca_stats_t stats = ccaStats();
+
+    CbrIndPayload ind = {
+        .avgPercentMilli = htonl((uint32_t)(stats.avg_percent * 1000.0f)),
+        .latestPercentMilli = htonl((uint32_t)(stats.latest_percent * 1000.0f)),
+        .validSamples = htonl(stats.valid_samples),
+        .rejectedSamples = htonl(stats.rejected_samples),
+    };
+
+    const auto *bytes = reinterpret_cast<const uint8_t *>(&ind);
+    if (obu_comm_usb_connected()) UsbStream::instance().publishFrame(COMM_FRAME_CBR_IND, bytes, sizeof(ind));
+    if (obu_comm_ble_connected()) BtStream::instance().publishFrame(COMM_FRAME_CBR_IND, bytes, sizeof(ind));
+}
+
+void WifiController::cbrIndTaskEntry(void *arg)
+{
+    static_cast<WifiController *>(arg)->cbrIndTask();
+}
+
+void WifiController::cbrIndTask()
+{
+    for (;;)
+    {
+        if (cbrIndIntervalMs_ <= 0)
+        {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+        cbrIndPublish();
+        vTaskDelay(pdMS_TO_TICKS(cbrIndIntervalMs_));
+    }
+}
+
+void WifiController::cbrIndStart(uint32_t intervalMs)
+{
+    cbrIndIntervalMs_ = (int)intervalMs;
+    if (!cbrIndTask_)
+    {
+        xTaskCreate(&WifiController::cbrIndTaskEntry, "tCbrInd", 3072, this, 2, &cbrIndTask_);
     }
 }
 
@@ -792,7 +955,7 @@ static int do_cca_test_cmd(int argc, char **argv)
         fprintf(stdout, "ccatest: --no-start, sampling existing counter state only\n");
     }
 
-    phy_cca_cnt_t prev = {0};
+    phy_cca_cnt_t prev = {};
     bool have_prev = false;
 
     for (int i = 0; i < samples; i++)
@@ -802,7 +965,7 @@ static int do_cca_test_cmd(int argc, char **argv)
         // guard bytes past the 8 used bytes catch phy_get_cca_cnt writing more than expected
         uint32_t buf[8];
         for (int j = 0; j < 8; j++) buf[j] = CCA_TEST_CANARY;
-        phy_cca_cnt_t *out = (phy_cca_cnt_t *)buf;
+        auto *out = reinterpret_cast<phy_cca_cnt_t *>(buf);
         bool flag = phy_get_cca_cnt(out);
 
         int overrun = -1;
@@ -847,159 +1010,9 @@ static int do_cca_test_cmd(int argc, char **argv)
     return 0;
 }
 
-void register_cca_test_cmd(void)
-{
-    cca_test_args.window = arg_int0("w", "window", "<cycles>", "count ceiling passed to phy_set_cca_cnt, PHY clock cycles @ ~39.8MHz, max 0x07FFFFFF (~3.35s) (default ~1s)");
-    cca_test_args.samples = arg_int0("n", "samples", "<n>", "number of samples to take (default 10)");
-    cca_test_args.interval = arg_int0("i", "interval", "<ms>", "delay between samples in ms (default 1000)");
-    cca_test_args.no_start = arg_lit0(NULL, "no-start", "don't call phy_set_cca_cnt, just sample current counter state");
-    cca_test_args.end = arg_end(2);
-
-    const esp_console_cmd_t cca_test_cmd = {
-        .command = "ccatest",
-        .help = "EXPERIMENTAL: probe undocumented PHY CCA busy/total counters (see obu_wifi.c comment above do_cca_test_cmd)",
-        .hint = NULL,
-        .func = &do_cca_test_cmd,
-        .argtable = &cca_test_args
-    };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&cca_test_cmd));
-}
-
-// ============================ CCA/DCC MEASUREMENT (background) ============
-// Continuous ETSI ITS-G5 DCC channel-busy-ratio measurement, built on the
-// hardware validation in docs/esp_dcc_measurements.md (confirmed against a
-// reference load generator across idle/~5%/~10%/~45% channel load).
-
-#define CCA_WINDOW_CYCLES     40000000u // ~1s at the confirmed ~39.8MHz tick rate
-#define CCA_WINDOW_WAIT_MS    1100      // window + margin: ~39.8MHz needs ~1005ms to reach the ceiling
-#define CCA_HISTORY_LEN       5         // rolling window for the filtered average
-#define CCA_OUTLIER_LOW_FRAC  0.5f      // drop samples below this fraction of the median: low dropouts were observed whenever a window landed in a gap of the reference generator's duty cycle, never a high spike (high spikes are the separate busy>total race, clamped below, not filtered here)
-#define CCA_TASK_STACK        3072
-#define CCA_TASK_PRIORITY     3
-
-static SemaphoreHandle_t cca_mutex;
-static TaskHandle_t cca_task;
-static float cca_history[CCA_HISTORY_LEN];
-static uint8_t cca_history_count;
-static uint8_t cca_history_next;
-static wifi_cca_stats_t cca_stats;
-
-static int cca_float_cmp(const void *a, const void *b)
-{
-    float fa = *(const float *)a, fb = *(const float *)b;
-    return (fa > fb) - (fa < fb);
-}
-
-/* Mean of the history, excluding samples below CCA_OUTLIER_LOW_FRAC * median.
- * Falls back to the plain mean if that excludes everything (shouldn't happen:
- * the median itself always qualifies). Caller holds cca_mutex. */
-static float cca_filtered_average(void)
-{
-    float sorted[CCA_HISTORY_LEN];
-    memcpy(sorted, cca_history, cca_history_count * sizeof(float));
-    qsort(sorted, cca_history_count, sizeof(float), cca_float_cmp);
-    float median = sorted[cca_history_count / 2];
-    float threshold = median * CCA_OUTLIER_LOW_FRAC;
-
-    float sum = 0;
-    int n = 0;
-    for (int i = 0; i < cca_history_count; i++)
-    {
-        if (cca_history[i] >= threshold)
-        {
-            sum += cca_history[i];
-            n++;
-        }
-    }
-    if (n == 0)
-    {
-        for (int i = 0; i < cca_history_count; i++) sum += cca_history[i];
-        n = cca_history_count;
-    }
-    return sum / n;
-}
-
-static void cca_measure_task(void *arg)
-{
-    uint32_t last_total = 0, last_busy = 0;
-    bool have_last = false;
-
-    for (;;)
-    {
-        phy_set_cca_cnt(CCA_WINDOW_CYCLES, 1);
-        vTaskDelay(pdMS_TO_TICKS(CCA_WINDOW_WAIT_MS));
-
-        phy_cca_cnt_t raw;
-        bool flag = phy_get_cca_cnt(&raw);
-
-        /* A genuinely completed window always reports exactly the configured
-         * ceiling. Anything else — never started, or a stale re-read of an
-         * earlier window after a start-pulse miss-fire (see
-         * docs/esp_dcc_measurements.md) — is discarded, not averaged. */
-        bool duplicate = have_last && raw.total == last_total && raw.busy == last_busy;
-        bool valid = flag && raw.total == CCA_WINDOW_CYCLES && !duplicate;
-
-        last_total = raw.total;
-        last_busy = raw.busy;
-        have_last = true;
-
-        if (!valid)
-        {
-            xSemaphoreTake(cca_mutex, portMAX_DELAY);
-            cca_stats.rejected_samples++;
-            xSemaphoreGive(cca_mutex);
-            continue;
-        }
-
-        uint32_t busy = raw.busy > raw.total ? raw.total : raw.busy; // busy>total race, see doc
-        float percent = 100.0f * (float)busy / (float)raw.total;
-
-        xSemaphoreTake(cca_mutex, portMAX_DELAY);
-        cca_history[cca_history_next] = percent;
-        cca_history_next = (cca_history_next + 1) % CCA_HISTORY_LEN;
-        if (cca_history_count < CCA_HISTORY_LEN) cca_history_count++;
-
-        cca_stats.latest_percent = percent;
-        cca_stats.avg_percent = cca_filtered_average();
-        cca_stats.valid_samples++;
-        cca_stats.has_data = true;
-        xSemaphoreGive(cca_mutex);
-    }
-}
-
-void wifi_cca_start(void)
-{
-    if (cca_task) return;
-
-    cca_mutex = xSemaphoreCreateMutex();
-    if (!cca_mutex)
-    {
-        ESP_LOGE(TAG, "cca: create mutex failed");
-        return;
-    }
-    if (xTaskCreate(cca_measure_task, "tCca", CCA_TASK_STACK, NULL, CCA_TASK_PRIORITY, &cca_task) != pdTRUE)
-    {
-        ESP_LOGE(TAG, "cca: create task failed");
-        cca_task = NULL;
-    }
-}
-
-void wifi_get_cca_stats(wifi_cca_stats_t *stats)
-{
-    if (!cca_mutex)
-    {
-        memset(stats, 0, sizeof(*stats));
-        return;
-    }
-    xSemaphoreTake(cca_mutex, portMAX_DELAY);
-    *stats = cca_stats;
-    xSemaphoreGive(cca_mutex);
-}
-
 static int do_cca_stats_cmd(int argc, char **argv)
 {
-    wifi_cca_stats_t stats;
-    wifi_get_cca_stats(&stats);
+    wifi_cca_stats_t stats = WifiController::instance().ccaStats();
     if (!stats.has_data)
     {
         fprintf(stdout, "no valid CBR window yet (valid=%lu rejected=%lu)\n",
@@ -1012,20 +1025,9 @@ static int do_cca_stats_cmd(int argc, char **argv)
     return 0;
 }
 
-void register_cca_stats_cmd(void)
-{
-    const esp_console_cmd_t cmd = {
-        .command = "ccastats",
-        .help = "show background ETSI DCC channel-busy-ratio measurement (see wifi_cca_start)",
-        .hint = NULL,
-        .func = &do_cca_stats_cmd,
-    };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
-}
-
 // ============================ DCCMON (background printer) =================
 // `dccmon` console cmd starts/stops a background task that periodically logs
-// wifi_get_cca_stats()'s filtered average — a live view of the CBR measured
+// WifiController::ccaStats()'s filtered average — a live view of the CBR measured
 // in docs/esp_dcc_measurements.md, without blocking the console like `ccatest`.
 
 static int dccmon_interval_ms = -1; // <=0: task idles, doesn't print
@@ -1041,8 +1043,7 @@ static void dccmon_task_fn(void *arg)
             continue;
         }
 
-        wifi_cca_stats_t stats;
-        wifi_get_cca_stats(&stats);
+        wifi_cca_stats_t stats = WifiController::instance().ccaStats();
         if (stats.has_data)
         {
             /* fprintf, not ESP_LOGI: CONFIG_LOG_DEFAULT_LEVEL=2 (WARN) in this
@@ -1092,6 +1093,37 @@ static int do_dccmon_cmd(int argc, char **argv)
     return 0;
 }
 
+// ============================ console registration =========================
+
+void register_cca_test_cmd(void)
+{
+    cca_test_args.window = arg_int0("w", "window", "<cycles>", "count ceiling passed to phy_set_cca_cnt, PHY clock cycles @ ~39.8MHz, max 0x07FFFFFF (~3.35s) (default ~1s)");
+    cca_test_args.samples = arg_int0("n", "samples", "<n>", "number of samples to take (default 10)");
+    cca_test_args.interval = arg_int0("i", "interval", "<ms>", "delay between samples in ms (default 1000)");
+    cca_test_args.no_start = arg_lit0(NULL, "no-start", "don't call phy_set_cca_cnt, just sample current counter state");
+    cca_test_args.end = arg_end(2);
+
+    const esp_console_cmd_t cca_test_cmd = {
+        .command = "ccatest",
+        .help = "EXPERIMENTAL: probe undocumented PHY CCA busy/total counters (see obu_wifi.cpp comment above do_cca_test_cmd)",
+        .hint = NULL,
+        .func = &do_cca_test_cmd,
+        .argtable = &cca_test_args
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&cca_test_cmd));
+}
+
+void register_cca_stats_cmd(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "ccastats",
+        .help = "show background ETSI DCC channel-busy-ratio measurement (see WifiController::ccaStart)",
+        .hint = NULL,
+        .func = &do_cca_stats_cmd,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
+}
+
 void register_dccmon_cmd(void)
 {
     dccmon_args.interval = arg_int0("i", "interval", "<ms>", "print interval in ms (default 2000)");
@@ -1106,56 +1138,4 @@ void register_dccmon_cmd(void)
         .argtable = &dccmon_args
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
-}
-
-// ============================ CBR_IND (wire protocol push) =================
-// Same data as `dccmon`, pushed as COMM_FRAME_CBR_IND over USB/BLE (whichever
-// is connected) instead of printed — gated by COMM_FRAME_CMD_CBR_START/STOP
-// (obu_comm.c). Mirrors wifi_task's existing dual-publish-if-connected pattern.
-
-static int cbr_ind_interval_ms = -1; // <=0: task idles, doesn't publish
-static TaskHandle_t cbr_ind_task;
-
-static void cbr_ind_publish(void)
-{
-    wifi_cca_stats_t stats;
-    wifi_get_cca_stats(&stats);
-
-    CbrIndPayload ind = {
-        .avgPercentMilli = htonl((uint32_t)(stats.avg_percent * 1000.0f)),
-        .latestPercentMilli = htonl((uint32_t)(stats.latest_percent * 1000.0f)),
-        .validSamples = htonl(stats.valid_samples),
-        .rejectedSamples = htonl(stats.rejected_samples),
-    };
-
-    if (obu_comm_usb_connected()) usb_stream_publish_frame(COMM_FRAME_CBR_IND, (const uint8_t *)&ind, sizeof(ind));
-    if (obu_comm_ble_connected()) bt_stream_publish_frame(COMM_FRAME_CBR_IND, (const uint8_t *)&ind, sizeof(ind));
-}
-
-static void cbr_ind_task_fn(void *arg)
-{
-    for (;;)
-    {
-        if (cbr_ind_interval_ms <= 0)
-        {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue;
-        }
-        cbr_ind_publish();
-        vTaskDelay(pdMS_TO_TICKS(cbr_ind_interval_ms));
-    }
-}
-
-void wifi_cbr_ind_start(uint32_t interval_ms)
-{
-    cbr_ind_interval_ms = (int)interval_ms;
-    if (!cbr_ind_task)
-    {
-        xTaskCreate(cbr_ind_task_fn, "tCbrInd", 3072, NULL, 2, &cbr_ind_task);
-    }
-}
-
-void wifi_cbr_ind_stop(void)
-{
-    cbr_ind_interval_ms = -1;
 }

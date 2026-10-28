@@ -13,6 +13,7 @@
 #include "config.h"
 #include "fw_update.h"
 #include "obu_wifi.h"
+#include "cmd_tx.h"
 
 static const char TAG[] = "OBU_COMM";
 
@@ -165,7 +166,7 @@ void obu_comm_feed_inplace(obu_comm_reassembler_t *r, int len,
 /* ── Config command sub-protocol ────────────────────────────────────────
  * Protocol: wizard sends  "CFG:key=value\n"
  *           device replies "CFG_OK:key\n" or "CFG_ERR:message\n"
- * Keys map directly to NVS keys used by config.c (namespace "its").
+ * Keys map directly to NVS keys used by config.cpp (namespace "its").
  * ──────────────────────────────────────────────────────────────────────*/
 
 /* Map key name → config_index_t */
@@ -214,8 +215,7 @@ static void on_ping(obu_comm_reply_fn reply, void *ctx)
 {
     char buffer[1024];
 
-    wifi_stats_t stats;
-    wifi_get_stats(&stats);
+    wifi_stats_t stats = WifiController::instance().stats();
 
     int len = snprintf(buffer, 1024, "{\"rx\":%lu", stats.rx);
     len += snprintf(buffer + len, 1024 - len, ",\"rxErr\":%lu", stats.rxErr);
@@ -349,8 +349,7 @@ static void on_stop(uint8_t *frame, uint16_t frame_len, obu_comm_reply_fn reply,
 
 static void on_cbr_read(obu_comm_reply_fn reply, void *ctx)
 {
-    wifi_cca_stats_t stats;
-    wifi_get_cca_stats(&stats);
+    wifi_cca_stats_t stats = WifiController::instance().ccaStats();
 
     CbrIndPayload ind = {
         .avgPercentMilli = htonl((uint32_t)(stats.avg_percent * 1000.0f)),
@@ -376,13 +375,13 @@ static void on_cbr_start(uint8_t *frame, uint16_t frame_len, obu_comm_reply_fn r
         reply(COMM_FRAME_CMD_FAIL, NULL, 0, ctx);
         return;
     }
-    wifi_cbr_ind_start(intervalMs);
+    WifiController::instance().cbrIndStart(intervalMs);
     reply(COMM_FRAME_CMD_GOOD, NULL, 0, ctx);
 }
 
 static void on_cbr_stop(obu_comm_reply_fn reply, void *ctx)
 {
-    wifi_cbr_ind_stop();
+    WifiController::instance().cbrIndStop();
     reply(COMM_FRAME_CMD_GOOD, NULL, 0, ctx);
 }
 
@@ -413,23 +412,23 @@ void obu_comm_process_frame(uint16_t type, uint16_t length, uint8_t *payload,
             on_config(payload, length, reply, ctx);
             break;
         case COMM_FRAME_TX:
-            wifi_tx_frame(payload, length);
+            WifiController::instance().txFrame(payload, length);
             break;
 
         case COMM_FRAME_FW_BEGIN:
-            fw_update_begin(payload, length, reply, ctx);
+            FwUpdater::instance().begin(payload, length, reply, ctx);
             break;
         case COMM_FRAME_FW_DATA:
-            fw_update_data(payload, length, reply, ctx);
+            FwUpdater::instance().data(payload, length, reply, ctx);
             break;
         case COMM_FRAME_FW_END:
-            fw_update_end(reply, ctx);
+            FwUpdater::instance().end(reply, ctx);
             break;
         case COMM_FRAME_FW_ABORT:
-            fw_update_abort(reply, ctx);
+            FwUpdater::instance().abort(reply, ctx);
             break;
         case COMM_FRAME_FW_CONFIRM:
-            fw_update_confirm(reply, ctx);
+            FwUpdater::instance().confirm(reply, ctx);
             break;
 
         case COMM_FRAME_CMD_CBR_READ:
@@ -440,6 +439,16 @@ void obu_comm_process_frame(uint16_t type, uint16_t length, uint8_t *payload,
             break;
         case COMM_FRAME_CMD_CBR_STOP:
             on_cbr_stop(reply, ctx);
+            break;
+
+        case COMM_FRAME_TX_LOOP_START:
+            start_tx_loop(payload, length, reply, ctx);
+            break;
+        case COMM_FRAME_TX_LOOP_STOP:
+            stop_tx_loop(reply, ctx);
+            break;
+        case COMM_FRAME_TX_LOOP_STATUS:
+            status_tx_loop(reply, ctx);
             break;
 
         default:

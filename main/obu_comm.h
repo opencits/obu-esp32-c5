@@ -3,17 +3,21 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define COMM_VERSION "0.6"
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define COMM_VERSION "0.8"
 
 #define COMM_MAGIC 0x7384
 
 #define COMM_FRAME_PING 1
 #define COMM_FRAME_PONG 2
 
-#define COMM_FRAME_CMD_REBOOT 20
-#define COMM_FRAME_CMD_CONFIG 21
-#define COMM_FRAME_CMD_START  22
-#define COMM_FRAME_CMD_STOP   23
+#define COMM_FRAME_CMD_REBOOT   20
+#define COMM_FRAME_CMD_CONFIG   21
+#define COMM_FRAME_CMD_START    22
+#define COMM_FRAME_CMD_STOP     23
 
 #define COMM_FRAME_CMD_GOOD 28
 #define COMM_FRAME_CMD_FAIL 29
@@ -23,7 +27,7 @@
 
 /* Firmware push over the existing wire protocol (BLE/USB), into esp_ota_*
  * directly — bypasses esp_https_ota, whose WiFi STA never actually
- * associates in this firmware. See fw_update.c. */
+ * associates in this firmware. See fw_update.cpp. */
 #define COMM_FRAME_FW_BEGIN    40
 #define COMM_FRAME_FW_DATA     41
 #define COMM_FRAME_FW_END      42
@@ -34,11 +38,15 @@
 
 /* ETSI DCC channel-busy-ratio (CBR), see docs/esp_dcc_measurements.md. READ
  * gets one CBR_IND immediately; START/STOP gate a periodic CBR_IND push
- * (USB/BLE, whichever is connected) driven by wifi_cbr_ind_start/stop. */
+ * (USB/BLE, whichever is connected) driven by WifiController::cbrIndStart/cbrIndStop. */
 #define COMM_FRAME_CMD_CBR_READ   50
 #define COMM_FRAME_CMD_CBR_START  51
 #define COMM_FRAME_CMD_CBR_STOP   52
 #define COMM_FRAME_CBR_IND        53
+
+#define COMM_FRAME_TX_LOOP_START  60
+#define COMM_FRAME_TX_LOOP_STOP   61
+#define COMM_FRAME_TX_LOOP_STATUS 62  /* request (empty) and reply (JSON fps/bps/err/interval/len) */
 
 #define COMM_MAX_BUF_SIZE (64*1024)
 
@@ -83,6 +91,15 @@ typedef struct {
 typedef struct {
   uint32_t value;
 } __packed FwAckPayload;
+
+/* TX_LOOP_START payload, network byte order; replies CMD_GOOD, or CMD_FAIL if
+ * out of range. Frame = fixed 34-byte ITS header + random payload (cmd_tx.cpp). */
+typedef struct {
+  uint32_t intervalMs;   // 1..3600000 ms, 0 = 1000; tick-quantized (10 ms at HZ=100)
+  uint32_t frameLen;     // random payload bytes after the header, 0..1466; 0 = keep current (128 at boot)
+  int32_t  txPower;      // 2..20 dBm, 0 = keep current
+  uint32_t datarate;     // kbps (3000..27000, 802.11p 10 MHz), 0 = keep current
+} __packed TxStartPayload;
 
 /* Upper bound keeps pdMS_TO_TICKS' 32-bit ms*HZ product from overflowing. */
 #define CBR_IND_MAX_INTERVAL_MS 3600000u
@@ -139,3 +156,7 @@ void obu_comm_process_frame(uint16_t type, uint16_t length, uint8_t *payload,
 
 bool obu_comm_ble_connected(void);
 bool obu_comm_usb_connected(void);
+
+#ifdef __cplusplus
+}
+#endif

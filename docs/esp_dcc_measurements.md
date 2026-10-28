@@ -26,7 +26,7 @@ same undocumented-blob category as `phy_11p_set`/`phy_change_channel` (see
 
 Reverse-engineered from RISC-V disassembly (`riscv32-esp-elf-objdump`), then
 confirmed against real hardware via the `ccatest` console command added to
-`main/obu_wifi.c`:
+`main/obu_wifi.cpp`:
 
 ```c
 typedef struct {
@@ -78,13 +78,13 @@ Backing MMIO registers (esp32c5):
 
 First attempt (self-TX via `tx -i 10`) was inconclusive — busy/total ratios
 during TX (0.04%–0.87%) overlapped heavily with the no-TX baseline
-(0.0%–0.77%), no clear step change. Root cause: `cmd_tx.c`'s `tx_task` only
+(0.0%–0.77%), no clear step change. Root cause: `cmd_tx.cpp`'s `tx_task` only
 polls on a **100ms** `vTaskDelay` loop, so `-i 10` (or any interval < 100ms)
 actually fires at ~100ms regardless of the requested value — the intended TX
 duty cycle (~1.8% of airtime at `-i 10`, easily distinguishable from ambient
 noise) was actually ~0.18%, small enough to hide inside the ambient `busy`
 variance seen even at idle. **Not fixed** (out of scope for this
-investigation, flagged for whoever touches `cmd_tx.c` next).
+investigation, flagged for whoever touches `cmd_tx.cpp` next).
 
 **Resolved with a second real OBU2X unit as an external reference load
 generator** (known transmitter, independent of this device's own radio and
@@ -133,26 +133,26 @@ guidance above: a real DCC polling loop must detect a stale/repeated
 
 ## Bugs found and fixed along the way (unrelated to CCA itself)
 
-- **`cmd_tx.c`'s `SAMPLE_PACKET_HEX` was stale since commit `8c20558`
+- **`cmd_tx.cpp`'s `SAMPLE_PACKET_HEX` was stale since commit `8c20558`
   "Integration with Apps"**: that commit widened `CommFrameHeader.channel`/
   `.rate` from `uint8_t` to `uint16_t` (14→16 byte struct) but didn't update
-  the hand-spliced synthetic header in the TX sample blob, so `wifi_tx_frame()`
+  the hand-spliced synthetic header in the TX sample blob, so `WifiController::txFrame()`
   rejected every `tx` attempt (`frame length mismatch: 34816 != 119`) — no
   frame ever went over the air. Fixed: resplice to the 16-byte layout
   (`channel=0`, `rate=0` → use current defaults, `frameLen=121`). Also fixed
   the matching stale "14-byte" description in `docs/design_notes.md`.
-- **`cmd_tx.c`'s `tx_task` 100ms polling floor** (described above) — found,
+- **`cmd_tx.cpp`'s `tx_task` 100ms polling floor** (described above) — found,
   not fixed.
 
 ## Production code: background measurement task + console tools
 
-`wifi_cca_start()` (`main/obu_wifi.c`, called from `app_main()`) runs a
+`WifiController::ccaStart()` (`main/obu_wifi.cpp`, called from `app_main()`) runs a
 continuous background task built on the confirmed mechanics above: arms a
 ~1s window, waits, reads it, discards anything that isn't a genuinely
 completed window (`flag==true && total==ceiling`, and not an exact-duplicate
 of the previous read — both signatures of the known start-pulse miss-fire),
 clamps the `busy>total` race, and keeps a 5-sample ring buffer. Exposes
-`wifi_get_cca_stats()`: `latest_percent` (raw, unfiltered — legitimately 0%
+`WifiController::ccaStats()`: `latest_percent` (raw, unfiltered — legitimately 0%
 on a real empty window) and `avg_percent` (median-centered, drops samples
 below 50% of the buffer's median — codifies the low-outlier pattern seen by
 hand against the reference load generator: dropouts were always low, never
@@ -174,15 +174,15 @@ not `ESP_LOGI`, because this project's `sdkconfig` sets
 
 Added for host-app consumption (`main/obu_comm.h`/`.c`), alongside the
 existing `CommHeader`-framed protocol (`docs/design_notes.md`,
-`wireshark_bridge/obu_mon.py`):
+`tools/obu_mon.py`, `tools/esp32-test`):
 
 - `COMM_FRAME_CMD_CBR_READ` (50) → device replies immediately with one
-  `COMM_FRAME_CBR_IND` (53) from the current `wifi_get_cca_stats()`.
+  `COMM_FRAME_CBR_IND` (53) from the current `WifiController::ccaStats()`.
 - `COMM_FRAME_CMD_CBR_START` (51), payload `CbrStartPayload{intervalMs}`
   (1..`CBR_IND_MAX_INTERVAL_MS` = 1h, else `CMD_FAIL`) → starts a background task
-  (`wifi_cbr_ind_start`, same idle-sentinel pattern as `dccmon_task_fn`) that
+  (`WifiController::cbrIndStart`, same idle-sentinel pattern as `dccmon_task_fn`) that
   pushes `CBR_IND` on that interval to whichever transport(s) are connected —
-  mirrors the existing RX-frame dual-publish pattern in `wifi_task`.
+  mirrors the existing RX-frame dual-publish pattern in `WifiController::sniffTask`.
 - `COMM_FRAME_CMD_CBR_STOP` (52) → stops it.
 - `CbrIndPayload`: `avgPercentMilli`/`latestPercentMilli` (percent×1000,
   network byte order — no floats on the wire, same convention as the FW
@@ -191,8 +191,8 @@ existing `CommHeader`-framed protocol (`docs/design_notes.md`,
 
 New generic publish helpers added to support the proactive (unsolicited)
 push, since it has no live request `ctx` to reply through:
-`usb_stream_publish_frame()` (wraps the existing `usb_reply`),
-`bt_stream_publish_frame()` (wraps the existing `bt_enqueue_frame`).
+`UsbStream::publishFrame()` (wraps the existing `UsbStream::reply`),
+`BtStream::publishFrame()` (wraps the existing `BtStream::enqueueFrame`).
 
 **Hardware-verified** (`/dev/ttyACM1`, the native USB-Serial-JTAG port —
 distinct from the UART console port used for `ccatest`/`dccmon`, see
@@ -210,7 +210,7 @@ output.
 ## Reproducing
 
 `ccatest [-w <cycles>] [-n <samples>] [-i <interval_ms>] [--no-start]` in
-`main/obu_wifi.c` (registered in `main.c`). Each sample prints
+`main/obu_wifi.cpp` (registered in `main.cpp`). Each sample prints
 `phy_get_cca_cnt`'s decoded `total`/`busy`/flag, the raw register reads
 (independent cross-check), a canary-guarded overrun check on the output
 buffer, and the delta busy/total ratio since the previous sample. Default

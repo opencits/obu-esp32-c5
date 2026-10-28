@@ -35,6 +35,8 @@ After editing `sdkconfig` by hand, run `idf.py reconfigure` (not just `idf.py bu
 idf.py build
 ```
 
+Output dir: `cmake-build-esp32c5/` if `CMakeUserPresets.json` exists (idf.py uses its first preset), else `build/`. Check the "Running ninja in directory" line; don't flash a stale `build/*.bin`.
+
 Board options (HW_VARIANT, SD pins, sniffer queue/task sizing, LED pin, temp sensor) live in `main/Kconfig.projbuild`, set via `idf.py menuconfig`.
 
 ## Flash + monitor
@@ -43,6 +45,14 @@ Board options (HW_VARIANT, SD pins, sniffer queue/task sizing, LED pin, temp sen
 idf.py -p /dev/ttyACM0 -b 921600 flash monitor -b 115200
 ```
 Replace `/dev/ttyACM0` with the actual serial device.
+
+## FW update over the wire protocol (no esptool, no reset/boot buttons)
+
+Via the native "USB" port, app image only (bootloader/partition table unchanged):
+```
+tools/esp32-test --flash cmake-build-esp32c5/obu-esp32-c5.bin
+```
+FW_BEGIN/DATA/END into the other OTA slot, then reboot + FW_CONFIRM (cancels rollback). ~65 KiB/s, ~30 s for 1.7 MB.
 
 ## Flash a pre-built release (no esp-idf build needed)
 

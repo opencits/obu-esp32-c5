@@ -40,8 +40,8 @@ static void initialize_filesystem(void)
 #if CONFIG_SNIFFER_STORE_HISTORY
     static wl_handle_t wl_handle;
     const esp_vfs_fat_mount_config_t mount_config = {
+        .format_if_mount_failed = true,
         .max_files = 4,
-        .format_if_mount_failed = true
     };
     esp_err_t err = esp_vfs_fat_spiflash_mount_rw_wl(HISTORY_MOUNT_POINT, "storage", &mount_config, &wl_handle);
     if (err != ESP_OK) {
@@ -52,7 +52,7 @@ static void initialize_filesystem(void)
 }
 
 /* Initialize wifi with tcp/ip adapter */
-static void initialize_wifi(void)
+static void initialize_wifi()
 {
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     modem_syscon_ll_enable_fe_40m_clock(&MODEM_SYSCON, 1);
@@ -62,7 +62,7 @@ static void initialize_wifi(void)
     ESP_ERROR_CHECK(esp_wifi_start());
 }
 
-static void setup_wifi_power(void)
+static void setup_wifi_power()
 {
     int8_t tx_power;
     esp_err_t ret = config_get_i8(CONFIG_INDEX_WIFI_TX_POWER, &tx_power);
@@ -72,14 +72,15 @@ static void setup_wifi_power(void)
             ESP_LOGE(TAG, "TX power invalid: %d", tx_power);
         }
         else {
-            wifi_set_txpower(tx_power);
+            WifiController::instance().setTxPower(tx_power);
         }
     }
-    fprintf(stdout, "uOBU (%d dBm) version: %s\n", wifi_get_txpower(), COMM_VERSION);
+    fprintf(stdout, "uOBU (%d dBm) version: %s\n", WifiController::instance().txPower(), COMM_VERSION);
 }
 
 static esp_console_repl_t *repl;
-static void console_init(void)
+
+static void console_init()
 {
     // 31 buffer size - length of colors and 1 space after prompt - 1 closing angle bracket - 1 null byte
     const size_t max_nodeid_length = 31 - (sizeof(LOG_COLOR_I " " LOG_RESET_COLOR) - 1) - 1 - 1;
@@ -112,17 +113,15 @@ static void console_init(void)
 #endif
 }
 
-int cmd_reboot(int argc, char **argv)
+static int cmd_reboot(int argc, char **argv)
 {
     (void)argc;
     (void)argv;
-
     esp_restart();
-
     return 1;
 }
 
-void register_reboot(void)
+static void register_reboot(void)
 {
     const esp_console_cmd_t cmd = {
         .command = "reboot",
@@ -133,14 +132,14 @@ void register_reboot(void)
     ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
 }
 
-int cmd_log_level(int argc, char **argv)
+static int cmd_log_level(int argc, char **argv)
 {
     if (argc > 1) {
         const char* tag = argv[1];
         esp_log_level_t level = esp_log_level_get(tag);
         if (level > ESP_LOG_NONE) {
             if (argc > 2) {
-                esp_log_level_t levelNew = atoi(argv[2]);
+                esp_log_level_t levelNew = static_cast<esp_log_level_t>(atoi(argv[2]));
                 if (levelNew < ESP_LOG_ERROR || levelNew > ESP_LOG_VERBOSE) {
                     fprintf(stderr, "Invalid log level %d\n", levelNew);
                     return 1;
@@ -159,7 +158,7 @@ int cmd_log_level(int argc, char **argv)
     return 0;
 }
 
-void register_loglevel(void)
+static void register_loglevel(void)
 {
     const esp_console_cmd_t cmd = {
         .command = "loglevel",
@@ -170,14 +169,14 @@ void register_loglevel(void)
     ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
 }
 
-void app_main(void)
+extern "C" void app_main(void)
 {
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_timer_init();
 
     config_init();
 
-    led_init();
+    LedController::instance().init();
 
     initialize_filesystem();
 
@@ -190,10 +189,10 @@ void app_main(void)
     /*--- Initialize Console ---*/
     console_init();
 
-    wifi_init();
+    WifiController::instance().init();
     sniffer_init();
-    ota_init();
-    fw_update_init();
+    OtaManager::instance().init();
+    FwUpdater::instance().init();
 
     /* Register commands */
     register_sniffer_cmd();
@@ -214,20 +213,20 @@ void app_main(void)
 
     register_dccmon_cmd();
 
-    usb_stream_init();
-    usb_config_rx_start();   /* USB RX config channel for setup wizard */
-    bt_stream_init();
+    UsbStream::instance().init();
+    UsbStream::instance().startRx();   /* USB RX config channel for setup wizard */
+    BtStream::instance().init();
 
-    wifi_autostart();     /* start WIFI — sets phy_11p_set(1,0) */
+    WifiController::instance().autostart();     /* start WIFI — sets phy_11p_set(1,0) */
 
-    wifi_cca_start();      /* background ETSI DCC channel-busy-ratio measurement */
+    WifiController::instance().ccaStart();      /* background ETSI DCC channel-busy-ratio measurement */
 
-    usb_stream_send_ping();
+    UsbStream::instance().sendPing();
 
     // start console REPL
     ESP_ERROR_CHECK(esp_console_start_repl(repl));
 
-    led_update();
+    LedController::instance().update();
 
     setup_wifi_power();
 }

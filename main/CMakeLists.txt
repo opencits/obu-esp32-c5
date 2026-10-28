@@ -1,18 +1,18 @@
 idf_component_register(
     SRCS
-        "main.c"
-        "cmd_sniffer.c"
-        "cmd_tx.c"
-        "config.c"
-        "events.c"
-        "fw_update.c"
-        "led.c"
-        "ota.c"
-        "spi.c"
-        "bt_stream.c"
-        "usb_stream.c"
-        "obu_comm.c"
-        "obu_wifi.c"
+        "main.cpp"
+        "cmd_sniffer.cpp"
+        "cmd_tx.cpp"
+        "config.cpp"
+        "events.cpp"
+        "fw_update.cpp"
+        "led.cpp"
+        "ota.cpp"
+        "spi.cpp"
+        "bt_stream.cpp"
+        "usb_stream.cpp"
+        "obu_comm.cpp"
+        "obu_wifi.cpp"
     PRIV_REQUIRES
         app_trace
         app_update
@@ -30,3 +30,7 @@ idf_component_register(
         "."
 )
 
+
+# C++20 zero-fills omitted designated-initializer fields; the warning only adds
+# noise for the partially initialized ESP-IDF C structs used throughout.
+target_compile_options(${COMPONENT_LIB} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wno-missing-field-initializers>)

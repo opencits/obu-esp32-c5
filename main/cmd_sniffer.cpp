@@ -65,24 +65,24 @@ static int do_sniffer_cmd(int argc, char **argv)
     /* Check whether or not to stop sniffer: "--stop" option */
     if (sniffer_args.stop->count) {
         /* stop sniffer */
-        wifi_stop();
+        WifiController::instance().stop();
         return 0;
     }
 
     if (sniffer_args.power->count) {
         int tx_power = sniffer_args.power->ival[0];
-        wifi_set_txpower(tx_power);
+        WifiController::instance().setTxPower(tx_power);
         return 0;
     }
 
-    uint32_t channel = wifi_get_channel();
+    uint32_t channel = WifiController::instance().channel();
     if (sniffer_args.channel->count) {
         channel = sniffer_args.channel->ival[0];
-        wifi_set_channel(channel);
+        WifiController::instance().setChannel(channel);
     }
 
     if (sniffer_args.status->count) {
-        int tx_power = wifi_get_txpower();
+        int tx_power = WifiController::instance().txPower();
         fprintf(stdout, "tx power %d dBm, frequency %lu MHz\n", tx_power, channel);
         return 0;
     }
@@ -91,11 +91,11 @@ static int do_sniffer_cmd(int argc, char **argv)
     if (!sniffer_args.fcsfail->count) {
         filter &= ~WIFI_PROMIS_FILTER_MASK_FCSFAIL;
     }
-    wifi_set_filter(filter);
+    WifiController::instance().setFilter(filter);
 
 
     /* start sniffer */
-    wifi_start();
+    WifiController::instance().start();
     return 0;
 }
 

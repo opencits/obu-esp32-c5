@@ -16,26 +16,38 @@ transmission in the same band — see "Wire protocol" and "Transmit pipeline" be
 plumbing exists in the config layer but is not wired to anything live (see "Connectivity" below) — it is not
 required for capture or transmit.
 
-## Boot sequence (`main/main.c::app_main`)
+## Code structure (C++)
+
+All of `main/` is C++ (gnu++26, no exceptions/RTTI). Stateful modules are singleton classes declared in
+their module header and reached via `X::instance()` (private `constexpr` ctor, `constinit` static
+instance, so no static-init guard on hot or ISR-adjacent paths): `WifiController` (`obu_wifi.h`),
+`LedController` (`led.h`), `FwUpdater` (`fw_update.h`), `OtaManager` (`ota.h`), `UsbStream`
+(`usb_stream.h`), `BtStream` (`bt_stream.h`). FreeRTOS/esp_timer/NimBLE callbacks are static members that
+get the instance via their `arg`/`ctx` pointer. Stateless glue (`main`, `obu_comm`, `cmd_*`, `events`,
+`spi`, console `register_*_cmd()`s) is plain functions; `config.cpp` keeps the `config_get_*/set_*` API over
+one get/set template on a per-type NVS traits table. `-Wno-missing-field-initializers` is set for C++ in
+`main/CMakeLists.txt`, because partial designated initializers of IDF C structs are normal here.
+
+## Boot sequence (`main/main.cpp::app_main`)
 
 Single FreeRTOS app, no custom task framework beyond ESP-IDF's own. Order matters:
-`esp_event_loop_create_default → config_init → led_init → filesystem (history FAT) → SPI → WiFi driver init
-(esp_wifi_init, STA mode, started but never connected) → console REPL → wifi_init → sniffer_init → ota_init →
-register all esp_console commands (sniffer, tx, reboot, loglevel, ota, config) → usb_stream_init →
-usb_config_rx_start → bt_stream_init → wifi_autostart → usb_stream_send_ping → console_start_repl → led_update`.
+`esp_event_loop_create_default → config_init → LedController::init → filesystem (history FAT) → SPI → WiFi driver init
+(esp_wifi_init, STA mode, started but never connected) → console REPL → WifiController::init → sniffer_init → OtaManager::init →
+register all esp_console commands (sniffer, tx, reboot, loglevel, ota, config) → UsbStream::init →
+UsbStream::startRx → BtStream::init → WifiController::autostart → UsbStream::sendPing → console_start_repl → LedController::update`.
 
 All three external sinks/inputs — USB frame stream, USB config-RX (`CFG:`/`SCAN`/`REBOOT`), and BLE — are
 initialized unconditionally from `app_main` today; there is no dormant/not-wired-up module left over from
 earlier iterations of this codebase (that used to be true of an earlier revision — it no longer is, don't
-trust older assumptions here without re-checking `main.c`).
+trust older assumptions here without re-checking `main.cpp`).
 
 Most features are also exposed as `esp_console` commands (`sniffer`, `tx`, `ota`, config setters, `reboot`,
 `loglevel`) registered at startup — the REPL is a secondary control surface for bench use; the primary control
 path for an attached client (phone/host app) is the binary wire protocol over BLE/USB described next.
 
-## Wire protocol (`main/obu_comm.c`)
+## Wire protocol (`main/obu_comm.cpp`)
 
-Both external transports (USB-CDC via `usb_stream.c`, BLE GATT via `bt_stream.c`) speak the same
+Both external transports (USB-CDC via `usb_stream.cpp`, BLE GATT via `bt_stream.cpp`) speak the same
 length-prefixed binary framing and share one dispatcher, so the protocol only needs describing once:
 
 - `CommHeader` (`obu_comm.h`, packed, network byte order): `magic(u16)=0x7384 | seqNo(u16) | type(u16) | length(u16)`,
@@ -44,20 +56,30 @@ length-prefixed binary framing and share one dispatcher, so the protocol only ne
   buffer, `COMM_MAX_BUF_SIZE` = 64 KiB; BLE: reassembled per-write-chunk into a smaller 2 KiB buffer, control
   traffic only). An invalid magic or an oversized `length` resets the reassembler and resyncs on the next magic.
 - `obu_comm_process_frame()` dispatches by `type` (`obu_comm.h`):
-  - `COMM_FRAME_PING` → replies `COMM_FRAME_PONG` with a small JSON status blob (`{"txpower":...,"rx":...,"rxErr":...,"tx":...,"txErr":...}`, `wifi_get_txpower()`/`wifi_get_stats()`).
-  - `COMM_FRAME_PONG` → logged only (host replying to our own boot-time ping, see `usb_stream_send_ping()`).
+  - `COMM_FRAME_PING` → replies `COMM_FRAME_PONG` with a small JSON status blob (`{"txpower":...,"rx":...,"rxErr":...,"tx":...,"txErr":...}`, `WifiController::txPower()`/`WifiController::stats()`).
+  - `COMM_FRAME_PONG` → logged only (host replying to our own boot-time ping, see `UsbStream::sendPing()`).
   - `COMM_FRAME_CMD_REBOOT` → replies `COMM_FRAME_CMD_GOOD`, then `esp_restart()`.
-  - `COMM_FRAME_CMD_CONFIG` → payload is a `CFG:key=value` string (same mini-protocol as below), replies `COMM_FRAME_CMD_GOOD`/`_FAIL`.
-  - `COMM_FRAME_TX` → payload is `CommFrameHeader` + raw 802.11 frame bytes, handed to `wifi_tx_frame()` (see Transmit pipeline). No reply is sent either way.
+  - `COMM_FRAME_CMD_CONFIG` → payload `CFG:key=value` (write, then read back) or `CFG:key` (read). Replies
+    `COMM_FRAME_CMD_CONFIG` with the value as text (empty payload = key not set in NVS), or `COMM_FRAME_CMD_FAIL`.
+  - `COMM_FRAME_CMD_START`/`_STOP` → payload `"USB"`/`"BLE"`, gates the RX/CBR_IND push to that transport
+    (`obu_comm_usb_connected()`/`_ble_connected()`); replies `CMD_GOOD`/`_FAIL`. Nothing streams before START.
+  - `COMM_FRAME_CMD_CBR_READ/START/STOP` → `COMM_FRAME_CBR_IND` (`CbrIndPayload`), see `docs/esp_dcc_measurements.md`.
+  - `COMM_FRAME_FW_*` → wire-protocol FW update, see OTA below.
+  - `COMM_FRAME_TX_LOOP_START/STOP/STATUS` → random-payload TX test loop (`cmd_tx.cpp`, see Transmit pipeline).
+    START payload `TxStartPayload`, replies `CMD_GOOD`/`_FAIL`; STATUS replies with its own type + JSON
+    `{"fps","bps","err","interval","len"}`.
+  - `COMM_FRAME_TX` → payload is `CommFrameHeader` + raw 802.11 frame bytes, handed to `WifiController::txFrame()` (see Transmit pipeline). No reply is sent either way.
   - `COMM_FRAME_RX` → sink-only, sent *from* device to client for each captured frame (not dispatched, no client can send it in).
-- `CFG:key=value` sub-protocol (`handle_config_command`/`cfg_key_to_index` in `obu_comm.c`): maps a fixed set of
-  string keys to `config_index_t` entries in `config.c` and calls `config_set_str/u8/u32`. Currently mapped:
-  `nodeid, mqtturi, wifi1ssid, wifi1pass, wifi2ssid, wifi2pass, wifiip, wifinm, wifigw, wifidns, wifiopen,
-  connmode, sniffmode, sniffms, wifims`. **Several of these are accepted and persisted but not consumed by any
+- `CFG:key=value` sub-protocol (`handle_config_command`/`cfg_key_to_index` in `obu_comm.cpp`): maps a fixed set of
+  string keys to `config_index_t` entries in `config.cpp` and calls `config_set_str/u8/u32/i8`. Currently mapped:
+  `nodeid, wifi1ssid, wifi1pass, wifi2ssid, wifi2pass, wifiip, wifinm, wifigw, wifidns, wifiopen, connmode,
+  sniffmode, led, channel, sniffms, wifims, txpower, loop`. `channel` is the NVS autostart channel — applied only at
+  boot (`WifiController::autostart`); there is no live-tune frame, so a host changes channel via `CFG:channel=` +
+  `CMD_REBOOT` (what `tools/esp32-test --chan` does). **Several of these are accepted and persisted but not consumed by any
   code path** — see "Dead/unwired config keys" below; a setup wizard will get `CFG_OK` back for them and nothing
   will actually change behavior.
 
-## Capture pipeline (RX) — `main/obu_wifi.c`
+## Capture pipeline (RX) — `main/obu_wifi.cpp`
 
 - Owns `esp_wifi` promiscuous mode and the 802.11p PHY. `phy_change_channel`/`phy_11p_set` are forward-declared
   `extern` with no header: `phy_11p_set` resolves to a mask-ROM address
@@ -68,55 +90,54 @@ length-prefixed binary framing and share one dispatcher, so the protocol only ne
 - `wifi_receive_cb` (promiscuous RX callback) builds a `CommFrameHeader` (channel, rate, rssi, noise, timestamp,
   frame length) and queues `{header, raw frame}` to `work_queue` (`CONFIG_SNIFFER_WORK_QUEUE_LEN`, default 128)
   via `queue_packet()`.
-- `wifi_task` drains the queue and fans each packet to `usb_stream_publish_packet()` →
-  `bt_stream_publish_packet()`, then posts `WIFI_RECEIVED_PACKET` (drives the LED) and frees the buffer. There is
+- `WifiController::sniffTask` drains the queue and fans each packet to `UsbStream::publishPacket()` →
+  `BtStream::publishPacket()`, then posts `WIFI_RECEIVED_PACKET` (drives the LED) and frees the buffer. There is
   no pcap/SD sink in this codebase — that used to be true of an earlier iteration built around a vendored
-  Espressif `cmd_pcap.c`/`cmd_sniffer.c` sniffer example; that code (and `sdcard.c`, `temperature.c`,
-  `wifi_manager.c`, `ethernet.c`) is gone from this tree. `obu_wifi.c` includes `pcap.h` (still a component
+  Espressif `cmd_pcap.c`/`cmd_sniffer.cpp` sniffer example; that code (and `sdcard.c`, `temperature.c`,
+  `wifi_manager.c`, `ethernet.c`) is gone from this tree. `obu_wifi.cpp` includes `pcap.h` (still a component
   dependency) but calls nothing from it — dead include.
-- `wifi_autostart()` reads `CONFIG_INDEX_AUTOSTART_CHAN`; only starts if channel is in `5800..5900` (802.11p band
-  sanity check). `sniffer_pause/resume` (`wifi_pause`/`wifi_resume`) are the radio hand-off primitives the BLE
+- `WifiController::autostart()` reads `CONFIG_INDEX_AUTOSTART_CHAN`; only starts if channel is in `5800..5900` (802.11p band
+  sanity check). `sniffer_pause/resume` (`WifiController::pause`/`WifiController::resume`) are the radio hand-off primitives the BLE
   coex scheduler (below) relies on.
-- `wifi_stats_t` (`rx/rxErr/tx/txErr` counters, `wifi_get_stats()`) is reported back to a client via
+- `wifi_stats_t` (`rx/rxErr/tx/txErr` counters, `WifiController::stats()`) is reported back to a client via
   `COMM_FRAME_PING` → `COMM_FRAME_PONG`.
 
-## Transmit pipeline (TX) — `main/obu_wifi.c`, `main/cmd_tx.c`
+## Transmit pipeline (TX) — `main/obu_wifi.cpp`, `main/cmd_tx.cpp`
 
-- `wifi_tx_frame(payload, length)`: payload is `CommFrameHeader` + raw 802.11 frame bytes (same header struct as
+- `WifiController::txFrame(payload, length)`: payload is `CommFrameHeader` + raw 802.11 frame bytes (same header struct as
   RX, though only `frameLen` is meaningful here — it must equal `length - sizeof(CommFrameHeader)` or the frame
   is rejected as a length mismatch). Validates the header actually fits before subtracting its size off
   `length` (guards against a short/malformed `COMM_FRAME_TX` frame underflowing the `uint16_t` length). Picks a
-  PHY rate from `tx_datarate` (`wifi_set_datarate()`, default 6 Mbps) and calls `esp_wifi_80211_tx_custom()`.
+  PHY rate from `tx_datarate` (`WifiController::setDatarate()`, default 6 Mbps) and calls `esp_wifi_80211_tx_custom()`.
 - `esp_wifi_80211_tx_custom()` is a from-scratch reimplementation of the (not-public) raw-TX hook into the
   vendored `esp_wifi` blob's internal ebuf/txdesc structures (`x_ebuf_t`/`x_eb_txdesc_t`, field names are
   guesses reverse-engineered from disassembly, hence `field_XX` — treat any change here as high-risk).
   `ieee80211_raw_frame_sanity_check()` is deliberately **not called** (commented out) — there is no independent
-  sanity check on the frame content before it reaches the driver; `wifi_tx_frame`'s length check above is the
+  sanity check on the frame content before it reaches the driver; `WifiController::txFrame`'s length check above is the
   only guard on the whole path.
-- TX power: `wifi_set_txpower(int dBm)` clamps to 2..20 dBm and calls `esp_wifi_set_max_tx_power()`, which takes
+- TX power: `WifiController::setTxPower(int dBm)` clamps to 2..20 dBm and calls `esp_wifi_set_max_tx_power()`, which takes
   units of 0.25 dBm — the conversion happens once, in this function. Reachable from: the `tx -p <dbm>` console
-  command, and `CONFIG_INDEX_WIFI_TX_POWER` (`"txpower"` NVS key) read back by `cmd_sniffer.c` on `sniffer`
-  command autostart. **Note:** `config.c`'s own setter for that NVS key, `config_set_tx_power()`, validates the
-  *stored* value against `8..84` (i.e. expects the value already in quarter-dBm units) but then calls
-  `wifi_set_txpower(value * 4)` (which expects plain dBm and multiplies by 4 itself) — the validation range and
-  the value's actual unit disagree with each other and with `cmd_sniffer.c`'s own read-back (`2..20`, plain
-  dBm). Nothing currently drives `config_set_tx_power` from the wire protocol (`"txpower"` isn't in
-  `cfg_key_to_index`), so this is latent rather than field-triggered, but do not use `config_set_*` to change TX
-  power until this is reconciled — use the `tx -p` console command or fix the setter first.
-- `cmd_tx.c`'s `tx` console command transmits a hardcoded sample frame (`SAMPLE_PACKET_HEX`) on a timer
-  (`-i <ms>`, default 1000 ms; `--stop` halts it) for bench testing without a connected client. Note the hex
-  blob has a synthetic 16-byte `CommFrameHeader` prefix spliced onto the real captured frame specifically so it
-  passes `wifi_tx_frame`'s length check — don't mistake the first 16 bytes for part of the 802.11 frame when
-  reading/editing that constant. (Was 14 bytes before `channel`/`rate` widened to `uint16_t`; if `CommFrameHeader`
-  changes size again, `SAMPLE_PACKET_HEX` needs resplicing too or `tx` silently stops transmitting.)
-- Starting `tx` takes a BLE/sniffer coex hold (`wifi_coex_hold()`), never released, for the lifetime of the task —
-  transmitting and the sniff/BLE duty-cycle below don't run concurrently.
+  command, and `CONFIG_INDEX_WIFI_TX_POWER` (`"txpower"` NVS key) read back by `cmd_sniffer.cpp` on `sniffer`
+  command autostart, and the wire protocol's `CFG:txpower=<dBm>` (`cfg_key_to_index` in `obu_comm.cpp`). The NVS
+  setter `config_set_tx_power()` validates 2..20 dBm and passes the plain dBm value straight to `setTxPower()`
+  (it used to pass `value * 4`, double-scaling every runtime change).
+- `cmd_tx.cpp` TX loop: fixed 34-byte 802.11 QoS-data + LLC/SNAP (0x8947) header (`ITS_HEADER_HEX`) + random
+  payload (xorshift32 seeded from `esp_random()`, refilled per frame; `esp_fill_random` is too slow per frame), sent
+  via `WifiController::txFrameRaw` (no `CommFrameHeader`; uses `setDatarate()` rate, counts into `stats()`). Driven by
+  the `tx` console command (`-i <ms>` default 1000, `-l <payload bytes>` default 128, `-p`, `-r`, `--stop`) or the
+  wire protocol `TX_LOOP_START`/`STOP`/`STATUS` (`TxStartPayload` in `obu_comm.h`; STATUS replies with its own type,
+  JSON). Paced by `vTaskDelayUntil`, so interval is tick-quantized (10 ms at `CONFIG_FREERTOS_HZ=100`, max 100 fps).
+  Frame length capped at `WIFI_TX_MAX_FRAME_LEN` (1500, `esp_wifi_80211_tx` limit).
+- Starting the TX loop takes a BLE/sniffer coex hold (`WifiController::coexHold()`), never released, for the lifetime of
+  the task, then `resumeForce()` so the radio is frozen *active* even if the hold landed in a BLE window (else
+  `setTxPower()`'s `while (paused_)` would spin forever) — transmitting and the sniff/BLE duty-cycle below don't
+  run concurrently.
 
-## BLE ⟷ sniffer coexistence (`main/bt_stream.c::coex_window_task`)
+## BLE ⟷ sniffer coexistence (`main/bt_stream.cpp: BtStream::coexTask`)
 
 The ESP32-C5 has a single RF transceiver shared between 5 GHz WiFi/802.11p and 2.4 GHz BLE — it cannot service
-WiFi promiscuous RX and BLE advertising/connections at the same time. `coex_window_task` alternates: promiscuous
-mode on for a sniff window (`wifi_resume()`) → off for a BLE window (`wifi_pause()`, drops promisc + 802.11p PHY
+WiFi promiscuous RX and BLE advertising/connections at the same time. `BtStream::coexTask` alternates: promiscuous
+mode on for a sniff window (`WifiController::resume()`) → off for a BLE window (`WifiController::pause()`, drops promisc + 802.11p PHY
 + `esp_wifi_stop`) → repeat. This exists so BLE scanners (notably older Android stacks with slow scan duty
 cycles — Galaxy S6 was the motivating case) actually see the advertisement between sniffer bursts.
 
@@ -128,14 +149,14 @@ cycles — Galaxy S6 was the motivating case) actually see the advertisement bet
   starving the link for the full window.
 - `esp_coex_preference_set(ESP_COEX_PREFER_BT)` is set at BLE init so WiFi yields enough airtime for a full BLE
   adv packet to go out; flipped to `ESP_COEX_PREFER_WIFI` during a USB-triggered WiFi scan
-  (`usb_stream.c::cfg_scan_task`) and frozen entirely (`wifi_coex_hold()`) while the USB config-RX channel
+  (`usb_stream.cpp::cfg_scan_task`) and frozen entirely (`WifiController::coexHold()`) while the USB config-RX channel
   has recent traffic, while `tx` is transmitting, or during a FW update, so those don't fight the coex scheduler
-  for the radio. Holds are counted (`wifi_coex_release()` per hold): the scheduler only resumes once every holder
+  for the radio. Holds are counted (`WifiController::coexRelease()` per hold): the scheduler only resumes once every holder
   has released, so e.g. USB going idle can't restart sniffing in the middle of a BLE FW update.
 - This is now the *only* WiFi/radio scheduling in the codebase — there is no separate "sniffer ⟷ WiFi STA"
   cycle mode layered on top of it (see Connectivity below for why).
 
-## `main/bt_stream.c` — NimBLE GATT server
+## `main/bt_stream.cpp` — NimBLE GATT server
 
 Service `b6e57e90-12d8-4a47-9b21-3f0000000001`, two characteristics:
 - **Notify/Write** (`...02`) — carries the same `CommHeader`-framed wire protocol described above (not a
@@ -143,12 +164,12 @@ Service `b6e57e90-12d8-4a47-9b21-3f0000000001`, two characteristics:
   frame to `ble_att_mtu - 3` per `ble_gatts_notify_custom` call. Writes from the phone are queued to
   `bt_reader_task`, reassembled the same way as USB, and dispatched through `obu_comm_process_frame`.
 - **Config** (`...03`) — 8 bytes = 4×`u16` LE, the coex cycle timings above; persisted to NVS namespace
-  `btstream` on write. Unrelated to the `config.c` "its" namespace / `CFG:` protocol.
+  `btstream` on write. Unrelated to the `config.cpp` "its" namespace / `CFG:` protocol.
 - Forces the controller's BT MAC as a **public** BLE address (`ble_hs_id_set_pub`, a private NimBLE API) because
   random-static addresses are silently ignored by some older Android BLE stacks (Galaxy S6) that haven't paired
   with that address before.
 
-## `main/usb_stream.c` — USB-CDC transport
+## `main/usb_stream.cpp` — USB-CDC transport
 
 Same `CommHeader` framing over USB-CDC (`usb_serial_jtag` driver, 4 KB TX / 256 B RX buffers). Also runs a
 line-oriented RX task (`usb_config_rx_task`) that feeds the same `obu_comm_feed_inplace`/dispatch path as
@@ -160,12 +181,12 @@ above, plus two USB-only text commands (handled before/alongside the binary prot
 
 ## Connectivity (config surface exists, nothing behind it runs)
 
-`main.c` brings WiFi up in STA mode (`esp_wifi_set_mode(WIFI_MODE_STA)`, `esp_wifi_start()`) purely so the
+`main.cpp` brings WiFi up in STA mode (`esp_wifi_set_mode(WIFI_MODE_STA)`, `esp_wifi_start()`) purely so the
 promiscuous-mode sniffer has a driver to attach to — **it never associates to an access point.** There is no
 `wifi_manager.c`/STA-connect logic, no `ethernet.c`, and no MQTT client wired into `CMakeLists.txt` in this
 codebase (an earlier iteration of this project had all three; they were removed along with pcap/SD/temperature
 support when this tree was rebuilt around the BLE/USB wire protocol above). Config keys for all of them still
-exist in `config.c` and some are still settable via `CFG:` — see below.
+exist in `config.cpp` and some are still settable via `CFG:` — see below.
 
 ### Dead/unwired config keys
 
@@ -182,42 +203,42 @@ These are accepted by `config_set_*`/`CFG:key=value` (persisted to NVS) but read
   back to actually filter broadcast frames.
 
 Live/consumed config keys: `nodeid` (console prompt, falls back to Ethernet-MAC-as-hex if unset even though
-Ethernet itself is dead — cosmetic only), `ledbrightness` (`led.c`), `autostartchan` (`wifi_autostart`),
-`txpower` (`cmd_sniffer.c`, see the unit mismatch note in Transmit pipeline above).
+Ethernet itself is dead — cosmetic only), `ledbrightness` (`led.cpp`), `autostartchan` (`WifiController::autostart`),
+`txpower` (`cmd_sniffer.cpp`, see the unit mismatch note in Transmit pipeline above).
 
 If any of this connectivity is meant to come back (WiFi STA for management, Ethernet, MQTT), it needs
-re-implementing from scratch against the current `obu_wifi.c`/`config.c` — don't assume the removed
+re-implementing from scratch against the current `obu_wifi.cpp`/`config.cpp` — don't assume the removed
 `wifi_manager.c`/`ethernet.c` can just be restored, the surrounding code (events, LED, coex) has moved on.
 
-## Events (`events.c`/`events.h`)
+## Events (`events.cpp`/`events.h`)
 
 Three `esp_event` bases: `CONFIG_EVENT_BASE` (events are `config_index_t` values, posted by every
-`config_set_*` in `config.c` — no subscriber exists in `main/`), `WIFI_EVENT_BASE`
-(`WIFI_STARTED/STOPPED/RECEIVED_PACKET/TRANSMIT_PACKET`, posted by `obu_wifi.c`, subscribed by `led.c` to drive
-the sniffer/TX activity LED), `COMM_EVENT_BASE` (`COMM_CONNECTED/DISCONNECTED`, subscribed by `led.c` but
+`config_set_*` in `config.cpp` — no subscriber exists in `main/`), `WIFI_EVENT_BASE`
+(`WIFI_STARTED/STOPPED/RECEIVED_PACKET/TRANSMIT_PACKET`, posted by `obu_wifi.cpp`, subscribed by `led.cpp` to drive
+the sniffer/TX activity LED), `COMM_EVENT_BASE` (`COMM_CONNECTED/DISCONNECTED`, subscribed by `led.cpp` but
 **never posted anywhere** — the comm-connected LED color path is wired up but currently unreachable dead code).
 
-## LED (`led.c`)
+## LED (`led.cpp`)
 
 Only the single-WS2812 model is actually live today: LED index 0 doubles as activity+status — idle background
 encodes sniffer-running/BLE-connected state (`apply_activity_led`), and `led_pulse_wifi_rx/wifi_tx/ble_tx/usb_tx`
 briefly flash over it per event without disturbing the background. `CONFIG_INDEX_LED_BRIGHTNESS` scales all RGB
-output globally (`set_led_with_brightness`). `led_init()` also lights strip indices 1–4 once at boot as a
+output globally (`LedController::setWithBrightness`). `LedController::init()` also lights strip indices 1–4 once at boot as a
 self-test sweep, but nothing updates them afterward — the previously-documented "legacy 4-LED i5r-r1 layout"
 (dedicated System/Sniffer/Ethernet/MQTT indicators) is not wired up in this tree; treat `LED_WIFI`/`LED_COMM`/
 `LED_CITS` state variables and their setter functions as currently-unused scaffolding, not a live display mode.
 
-## OTA (`ota.c`, `fw_update.c`)
+## OTA (`ota.cpp`, `fw_update.cpp`)
 
 Two independent ways to get a new app image into the non-running OTA partition
 (`esp_ota_get_next_update_partition`) — neither triggers the other:
 
-- **HTTPS pull** (`ota.c`): `esp_https_ota` (cert via `esp_crt_bundle`, SPIRAM-backed buffers), driven by the
+- **HTTPS pull** (`ota.cpp`): `esp_https_ota` (cert via `esp_crt_bundle`, SPIRAM-backed buffers), driven by the
   `ota` console command: `-u <url> [-r]` (update, optional reboot), `-C` (confirm/cancel rollback), `-R` (force
   rollback+reboot), `-S` (switch boot partition), `-i` (partition info). **Effectively dead in practice**: it
   needs WiFi STA associated to an AP, and per "Connectivity" below, STA is started at boot but never actually
   connects in this firmware tree — there is no STA-connect logic to reach a URL with.
-- **Wire-protocol push** (`fw_update.c`): the live path. A connected client (phone/host app) streams the image
+- **Wire-protocol push** (`fw_update.cpp`): the live path. A connected client (phone/host app) streams the image
   itself over the same `CommHeader`-framed BLE/USB protocol described above, straight into `esp_ota_write()` —
   bypassing `esp_https_ota` entirely. New frame types (`obu_comm.h`): `FW_BEGIN`(40)/`FW_DATA`(41)/`FW_END`(42)/
   `FW_ABORT`(43)/`FW_CONFIRM`(44), replied to with dedicated `FW_ACK`(45)/`FW_NAK`(46) frames (not `CMD_GOOD`/
@@ -225,7 +246,7 @@ Two independent ways to get a new app image into the non-running OTA partition
   reply mid-transfer).
   - `FW_BEGIN` payload is `{u32 totalSize}`, network byte order (`htonl`/`ntohl`) — every multi-byte field in
     this protocol is big-endian, including `CommFrameHeader`'s (`channel`/`rate`/`seconds`/`microseconds` are all
-    `htons`/`htonl`'d in `obu_wifi.c`); rejected if it exceeds the target partition's size. `esp_ota_begin()` erases the target
+    `htons`/`htonl`'d in `obu_wifi.cpp`); rejected if it exceeds the target partition's size. `esp_ota_begin()` erases the target
     region synchronously and can take several seconds — callers need a long (≥10s) timeout on this one frame,
     separate from the per-chunk timeout.
   - `FW_DATA` payload is `{u32 offset}` + raw chunk bytes. `offset` is mandatory: `esp_ota_write` is append-only
@@ -235,15 +256,15 @@ Two independent ways to get a new app image into the non-running OTA partition
     `esp_ota_set_boot_partition()`. **Does not reboot** — the client sends the existing `COMM_FRAME_CMD_REBOOT`
     once ready. `FW_ABORT` cancels a transfer in progress (`esp_ota_abort`). A ~15s idle timer auto-aborts a
     stalled transfer (dropped link, etc.) so the device doesn't sit BLE-frozen/mid-erase indefinitely.
-  - `FW_CONFIRM` calls `ota_confirm_running_partition()` (`ota.h`) — the same
+  - `FW_CONFIRM` calls `OtaManager::confirmRunningPartition()` (`ota.h`) — the same
     `esp_ota_mark_app_valid_cancel_rollback()` + timer-stop logic `ota -C` uses, now shared between the console
     command and the wire protocol so a post-update client can cancel the anti-brick rollback remotely.
-  - **Radio hand-off**: `fw_update_begin()` calls `wifi_coex_hold()` *then* `wifi_pause_force()` — not a bare
-    hold like `cmd_tx.c`. `wifi_pause()`/`wifi_resume()` no-op while any hold is outstanding (see "BLE ⟷ sniffer
+  - **Radio hand-off**: `FwUpdater::begin()` calls `WifiController::coexHold()` *then* `WifiController::pauseForce()` — not a bare
+    hold like `cmd_tx.cpp`. `WifiController::pause()`/`WifiController::resume()` no-op while any hold is outstanding (see "BLE ⟷ sniffer
     coexistence" above), so a hold alone taken during a sniff window freezes the radio *promiscuous-on*, starving
-    BLE for the whole transfer. Holding first stops `coex_window_task` from resuming in between; the forced pause
+    BLE for the whole transfer. Holding first stops `BtStream::coexTask` from resuming in between; the forced pause
     then works even when the USB rx task already holds coex (it takes its hold before dispatching `FW_BEGIN`).
-    Released (`wifi_coex_release()`) on `FW_END`/`FW_ABORT`/idle-timeout. Applied for both BLE and USB.
+    Released (`WifiController::coexRelease()`) on `FW_END`/`FW_ABORT`/idle-timeout. Applied for both BLE and USB.
 
 **Anti-brick safety net** (shared by both OTA paths): if the running partition isn't marked `VALID` at boot, a
 30-minute one-shot timer (`invalidate_and_reboot_timer`) is armed that force-rolls-back if the new firmware
@@ -283,7 +304,7 @@ against them while those files were still present, treat them as the record now 
     the `esp_console` REPL lives (`CONFIG_ESP_CONSOLE_UART_DEFAULT=y`). Shows up as a CH9102-style "USB Single
     Serial" device.
   - **"USB" port** → the chip's native USB-Serial-JTAG peripheral (GPIO13/USB_D-, GPIO14/USB_D+). This is what
-    `usb_stream.c` opens (`usb_serial_jtag_driver_install`) for the wire-protocol stream. Shows up as "USB
+    `usb_stream.cpp` opens (`usb_serial_jtag_driver_install`) for the wire-protocol stream. Shows up as "USB
     JTAG/serial debug unit", Espressif VID `303a`.
   - These don't conflict — different hardware peripherals, can run simultaneously.
   - **The native USB-Serial-JTAG controller cannot be repurposed as a USB-Ethernet (CDC-ECM/NCM/RNDIS) device.**
@@ -291,7 +312,7 @@ against them while those files were still present, treat them as the record now 
     functionality" — it's fixed-function (serial + JTAG only), not a general-purpose USB device stack. There is
     no other USB-OTG peripheral on this chip. Confirmed: this board cannot get Ethernet over either USB port.
 - **GPIO27 = onboard addressable RGB LED** (visible in the pinout diagram, between the two USB-C ports). The
-  firmware's `CONFIG_LEDSTRIP_PIN` is now set to **27** (was 26, which drives nothing on this board) so `led.c`
+  firmware's `CONFIG_LEDSTRIP_PIN` is now set to **27** (was 26, which drives nothing on this board) so `led.cpp`
   controls the LED that's actually populated.
 - **No Ethernet module wired** (confirmed) — disabled in `sdkconfig`: `CONFIG_ETHERNET_SPI_SUPPORT` is unset (no
   SPI Ethernet device gets instantiated). `CONFIG_ETH_USE_SPI_ETHERNET=y` is deliberately left **on** despite
@@ -301,14 +322,14 @@ against them while those files were still present, treat them as the record now 
   even though no W5500 code path runs (there's no `ethernet.c` in this tree at all now — see Connectivity).
 - **GPIO6 capacitor erratum** (this board specifically): a 100 nF cap on GPIO6 blocks SPI clock signal integrity
   unless zero-ohm resistor `R39` (right of the 5V pin) is desoldered. Previously latent (the now-removed
-  SD-card SPI clock pin defaulted to GPIO6, and `main.c` claimed it unconditionally at boot regardless of
+  SD-card SPI clock pin defaulted to GPIO6, and `main.cpp` claimed it unconditionally at boot regardless of
   whether a card was mounted). No longer relevant — see SD card removal below — but worth remembering if any
   future SPI peripheral on this board is tempted to use GPIO6.
 - **SD card support removed entirely.** This board has no SD card slot. Removed: `main/sdcard.c`/`.h`, the
   `mount`/`unmount` console commands, the `ENABLE_SD`/`SNIFFER_SD_MODE`/`SNIFFER_SD_SPI_MODE`/
   `SNIFFER_PIN_{MOSI,MISO,CLK,CS}`/`SNIFFER_MOUNT_POINT` Kconfig options, `cmd_pcap.c` and its
   `SNIFFER_PCAP_DESTINATION_*` build-time destinations entirely (JTAG/App-Trace, in-memory ring, SD — all gone
-  along with the file, not just the SD branch), and the SD-SPI branch in `spi.c` (Ethernet's SPI branch is kept
+  along with the file, not just the SD branch), and the SD-SPI branch in `spi.cpp` (Ethernet's SPI branch is kept
   — see Ethernet note above, even though nothing currently instantiates an Ethernet device on this board). If a
   future board has a real SD slot, this needs re-adding from scratch — avoid GPIO6 (capacitor erratum) and
   GPIO15–22 (flash/PSRAM, see I2C note below) when picking pins.
@@ -336,21 +357,32 @@ against them while those files were still present, treat them as the record now 
   `idf_component.yml`. If a future board needs an I2C sensor again, it'll need to be re-added from scratch — pick
   pins outside GPIO15–22.
 
+## Host tools (`tools/`)
+
+- `esp32-test` — Python/pyserial CLI over the USB wire protocol (Linux + Windows): `--status`, `--rx`/`--cbr`,
+  `--chan`, `--tx` (TX loop), `--flash` (FW_* update). Usage: `README.md`.
+  - Port open: USB-Serial-JTAG resets the chip on DTR=0/RTS=1. Linux asserts both at open and pyserial applies
+    DTR before RTS, so the tool opens with DTR=1/RTS=0 and drops DTR afterwards — never passes the reset state.
+  - Replies aren't request-correlated (except FW_ACK/NAK, CONFIG, TX_LOOP_STATUS), so it keeps requests
+    sequential; PING every 2 s doubles as keepalive (USB rx task releases its coex hold after 30 s host silence).
+- `obu_mon.py` — older serial monitor / pcap writer stub. `usb-serial-bridge.sh` — serial→TCP bridge for an
+  Android emulator.
+
 ## Other modules
 
-- `spi.c` — SPI bus init for the Ethernet module (SD card support removed — see Waveshare specifics above; note
+- `spi.cpp` — SPI bus init for the Ethernet module (SD card support removed — see Waveshare specifics above; note
   Ethernet itself has no live consumer either — see Connectivity above).
-- `config.c` — single NVS namespace `"its"`. `config_index_t` (`config.h`) is the canonical key enum;
+- `config.cpp` — single NVS namespace `"its"`. `config_index_t` (`config.h`) is the canonical key enum;
   `config_keys[]` maps each index to its NVS key name, type, and optional custom getter/setter (e.g. `nodeid`
   falls back to the Ethernet MAC formatted as hex if unset; `txpower` has a custom setter, see the unit-mismatch
   note in Transmit pipeline). All persistent settings go through `config_get_*`/`config_set_*`, never raw
-  `nvs_*` calls from other modules — the one exception is `bt_stream.c`, which keeps its coex-cycle config in
-  its own NVS namespace `btstream` rather than going through `config.c`.
+  `nvs_*` calls from other modules — the one exception is `bt_stream.cpp`, which keeps its coex-cycle config in
+  its own NVS namespace `btstream` rather than going through `config.cpp`.
 
 ## Legal
 
-The 5875–5935 MHz band is safety-critical ITS spectrum in the EU. Transmitting (TX path, `obu_wifi.c`'s
-`esp_wifi_80211_tx_custom`/`wifi_tx_frame`, driven by `cmd_tx.c` or a client's `COMM_FRAME_TX`) requires
+The 5875–5935 MHz band is safety-critical ITS spectrum in the EU. Transmitting (TX path, `obu_wifi.cpp`'s
+`esp_wifi_80211_tx_custom`/`WifiController::txFrame`, driven by `cmd_tx.cpp` or a client's `COMM_FRAME_TX`) requires
 complying with local regulations — this is a hard constraint on any TX-enabling work, not just a README
-disclaimer. In particular, verify `wifi_set_txpower()`'s behavior against actual RF output before relying on it
+disclaimer. In particular, verify `WifiController::setTxPower()`'s behavior against actual RF output before relying on it
 for compliance — see the unit-mismatch note under Transmit pipeline.

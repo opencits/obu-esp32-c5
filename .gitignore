@@ -10,3 +10,5 @@
 
 venv/
 .idea/
+/cmake-build-*/
+/CMakeUserPresets.json

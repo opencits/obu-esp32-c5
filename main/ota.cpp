@@ -1,6 +1,6 @@
 #include "sdkconfig.h"
 
-#include <stdbool.h>
+#include <cstring>
 
 #include "esp_crt_bundle.h"
 #include "esp_console.h"
@@ -21,41 +21,19 @@
 
 static const char TAG[] = "OTA";
 
-static struct {
-    struct arg_str *url;
-    struct arg_lit *reboot;
-    struct arg_lit *confirm;
-    struct arg_lit *rollback;
-    struct arg_lit *switch_part;
-    struct arg_lit *info;
-    struct arg_end *end;
-} ota_args;
+constinit OtaManager OtaManager::s_instance;
 
-static bool ota_task_running;
-static TaskHandle_t ota_task_handle;
-
-static char https_url[1024];
-static bool reboot_after_update;
-
-static esp_timer_handle_t invalidate_and_reboot_timer;
-
-esp_http_client_config_t http_client_config = {
-    .url = https_url,
-    .crt_bundle_attach = esp_crt_bundle_attach
-};
-
-esp_https_ota_config_t ota_config = {
-    .http_config = &http_client_config,
-    .bulk_flash_erase = true,
-    .buffer_caps = MALLOC_CAP_SPIRAM
-};
-
-static void ota_task(void *)
+void OtaManager::taskEntry(void *arg)
 {
-    esp_err_t res = esp_https_ota(&ota_config);
+    static_cast<OtaManager *>(arg)->task();
+}
+
+void OtaManager::task()
+{
+    esp_err_t res = esp_https_ota(&otaConfig_);
     if (res == ESP_OK)
     {
-        if (reboot_after_update)
+        if (rebootAfterUpdate_)
             esp_restart();
     }
     else
@@ -63,13 +41,11 @@ static void ota_task(void *)
         ESP_LOGE(TAG, "esp_https_ota failed: %s", esp_err_to_name(res));
     }
 
-    ota_task_running = false;
-
     vTaskDelete(NULL);
 }
 
-static void ota_event_handler(void* arg, esp_event_base_t event_base,
-                        int32_t event_id, void* event_data)
+void OtaManager::onEvent(void* arg, esp_event_base_t event_base,
+                         int32_t event_id, void* event_data)
 {
     if (event_base == ESP_HTTPS_OTA_EVENT) {
         switch (event_id) {
@@ -107,7 +83,117 @@ static void ota_event_handler(void* arg, esp_event_base_t event_base,
     }
 }
 
-static int ota_cmd(int argc, char **argv)
+bool OtaManager::startHttpsUpdate(const char *url, bool reboot)
+{
+    if (strlen(url) >= sizeof(httpsUrl_))
+    {
+        ESP_LOGE(TAG, "URL too long");
+        return false;
+    }
+
+    strcpy(httpsUrl_, url);
+    rebootAfterUpdate_ = reboot;
+
+    const esp_partition_t* other_app = esp_ota_get_next_update_partition(NULL);
+    if (other_app == NULL)
+    {
+        ESP_LOGE(TAG, "Could not get non-running partition");
+        return false;
+    }
+
+    otaConfig_.partition.staging = other_app;
+
+    xTaskCreate(taskEntry, "ota", OTA_TASK_STACK_SIZE,
+                this, CONFIG_SNIFFER_TASK_PRIORITY, &taskHandle_);
+    return true;
+}
+
+void OtaManager::onRollbackTimeout(void *)
+{
+    esp_err_t res = esp_ota_mark_app_invalid_rollback_and_reboot();
+    if (res != ESP_OK)
+        ESP_LOGE(TAG, "esp_ota_mark_app_invalid_rollback_and_reboot failed: %s", esp_err_to_name(res));
+}
+
+void OtaManager::initRollbackTimer()
+{
+    esp_timer_create_args_t create_args = {
+        .callback = onRollbackTimeout,
+        .arg = this,
+        .name = "ota_inval_reboot"
+    };
+
+    ESP_ERROR_CHECK(esp_timer_create(&create_args, &rollbackTimer_));
+
+    const esp_partition_t* other_app = esp_ota_get_next_update_partition(NULL);
+    if (other_app == NULL)
+    {
+        ESP_LOGE(TAG, "Could not get non-running partition");
+        return;
+    }
+    esp_ota_img_states_t other_state;
+    esp_err_t res = esp_ota_get_state_partition(other_app, &other_state);
+    if (res != ESP_OK)
+    {
+        ESP_LOGE(TAG, "esp_ota_get_state_partition failed: %s", esp_err_to_name(res));
+        return;
+    }
+
+    const esp_partition_t *current_app = esp_ota_get_running_partition();
+    esp_ota_img_states_t state;
+    res = esp_ota_get_state_partition(current_app, &state);
+    if ((res != ESP_OK || state != ESP_OTA_IMG_VALID) && other_state == ESP_OTA_IMG_VALID)
+    {
+        ESP_LOGW(TAG, "Current app partition is not marked valid, will perform rollback in 30 minutes if not confirmed by then!");
+        esp_timer_start_once(rollbackTimer_, (uint64_t)30 * 60 * 1000 * 1000);
+    }
+}
+
+esp_err_t OtaManager::confirmRunningPartition()
+{
+    esp_err_t res = esp_ota_mark_app_valid_cancel_rollback();
+    if (res != ESP_OK)
+    {
+        ESP_LOGE(TAG, "esp_ota_mark_app_valid_cancel_rollback failed: %s", esp_err_to_name(res));
+        return res;
+    }
+
+    res = esp_timer_stop(rollbackTimer_);
+    if (res != ESP_OK)
+    {
+        ESP_LOGW(TAG, "esp_timer_stop failed: %s. Maybe this app partition was already marked valid?", esp_err_to_name(res));
+    }
+    return ESP_OK;
+}
+
+void OtaManager::init()
+{
+    httpConfig_.url = httpsUrl_;
+    httpConfig_.crt_bundle_attach = esp_crt_bundle_attach;
+    otaConfig_.http_config = &httpConfig_;
+    otaConfig_.bulk_flash_erase = true;
+    otaConfig_.buffer_caps = MALLOC_CAP_SPIRAM;
+
+    ESP_ERROR_CHECK(esp_event_handler_register(ESP_HTTPS_OTA_EVENT, ESP_EVENT_ANY_ID, onEvent, this));
+
+    initRollbackTimer();
+}
+
+// ============================ `ota` console command ========================
+
+namespace {
+
+struct {
+    struct arg_str *url;
+    struct arg_lit *reboot;
+    struct arg_lit *confirm;
+    struct arg_lit *rollback;
+    struct arg_lit *switch_part;
+    struct arg_lit *info;
+    struct arg_end *end;
+} ota_args;
+
+int ota_cmd(int argc, char **argv)
 {
     int nerrors = arg_parse(argc, argv, (void **)&ota_args);
     if (nerrors != 0) {
@@ -129,7 +215,7 @@ static int ota_cmd(int argc, char **argv)
 
     if (ota_args.confirm->count)
     {
-        esp_err_t res = ota_confirm_running_partition();
+        esp_err_t res = OtaManager::instance().confirmRunningPartition();
         if (res != ESP_OK)
         {
             return 1;
@@ -165,26 +251,10 @@ static int ota_cmd(int argc, char **argv)
 
     if (ota_args.url->count)
     {
-        if (strlen(ota_args.url->sval[0]) >= sizeof(https_url))
+        if (!OtaManager::instance().startHttpsUpdate(ota_args.url->sval[0], ota_args.reboot->count))
         {
-            ESP_LOGE(TAG, "URL too long");
             return 1;
         }
-
-        strcpy(https_url, ota_args.url->sval[0]);
-        reboot_after_update = ota_args.reboot->count;
-
-        const esp_partition_t* other_app = esp_ota_get_next_update_partition(NULL);
-        if (other_app == NULL)
-        {
-            ESP_LOGE(TAG, "Could not get non-running partition");
-            return 1;
-        }
-
-        ota_config.partition.staging = other_app;
-
-        xTaskCreate(ota_task, "ota", OTA_TASK_STACK_SIZE,
-                    NULL, CONFIG_SNIFFER_TASK_PRIORITY, &ota_task_handle);
     }
 
     if (ota_args.info->count)
@@ -240,6 +310,7 @@ static int ota_cmd(int argc, char **argv)
     return 0;
 }
 
+} // namespace
 
 void register_ota_cmd(void)
 {
@@ -258,69 +329,4 @@ void register_ota_cmd(void)
         .argtable = &ota_args
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
-}
-
-static void invalidate_and_reboot(void *)
-{
-    esp_err_t res = esp_ota_mark_app_invalid_rollback_and_reboot();
-    if (res != ESP_OK)
-        ESP_LOGE(TAG, "esp_ota_mark_app_invalid_rollback_and_reboot failed: %s", esp_err_to_name(res));
-}
-
-static void init_invalidate_and_reboot_timer(void)
-{
-    esp_timer_create_args_t create_args = {
-        .callback = invalidate_and_reboot,
-        .arg = NULL,
-        .name = "ota_inval_reboot"
-    };
-
-    ESP_ERROR_CHECK(esp_timer_create(&create_args, &invalidate_and_reboot_timer));
-
-    const esp_partition_t* other_app = esp_ota_get_next_update_partition(NULL);
-    if (other_app == NULL)
-    {
-        ESP_LOGE(TAG, "Could not get non-running partition");
-        return;
-    }
-    esp_ota_img_states_t other_state;
-    esp_err_t res = esp_ota_get_state_partition(other_app, &other_state);
-    if (res != ESP_OK)
-    {
-        ESP_LOGE(TAG, "esp_ota_get_state_partition failed: %s", esp_err_to_name(res));
-        return;
-    }
-
-    const esp_partition_t *current_app = esp_ota_get_running_partition();
-    esp_ota_img_states_t state;
-    res = esp_ota_get_state_partition(current_app, &state);
-    if ((res != ESP_OK || state != ESP_OTA_IMG_VALID) && other_state == ESP_OTA_IMG_VALID)
-    {
-        ESP_LOGW(TAG, "Current app partition is not marked valid, will perform rollback in 30 minutes if not confirmed by then!");
-        esp_timer_start_once(invalidate_and_reboot_timer, (uint64_t)30 * 60 * 1000 * 1000);
-    }
-}
-
-esp_err_t ota_confirm_running_partition(void)
-{
-    esp_err_t res = esp_ota_mark_app_valid_cancel_rollback();
-    if (res != ESP_OK)
-    {
-        ESP_LOGE(TAG, "esp_ota_mark_app_valid_cancel_rollback failed: %s", esp_err_to_name(res));
-        return res;
-    }
-
-    res = esp_timer_stop(invalidate_and_reboot_timer);
-    if (res != ESP_OK)
-    {
-        ESP_LOGW(TAG, "esp_timer_stop failed: %s. Maybe this app partition was already marked valid?", esp_err_to_name(res));
-    }
-    return ESP_OK;
-}
-
-void ota_init(void)
-{
-    ESP_ERROR_CHECK(esp_event_handler_register(ESP_HTTPS_OTA_EVENT, ESP_EVENT_ANY_ID, ota_event_handler, NULL));
-
-    init_invalidate_and_reboot_timer();
 }

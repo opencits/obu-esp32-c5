@@ -1,17 +1,17 @@
 # 802.11p Radio Tuning Notes
 
-How `cmd_sniffer.c` switches the WiFi radio into 802.11p (ITS-G5, 5.9 GHz OCB) mode and tunes frequency. Central design doc: `docs/design_notes.md`.
+How `cmd_sniffer.cpp` switches the WiFi radio into 802.11p (ITS-G5, 5.9 GHz OCB) mode and tunes frequency. Central design doc: `docs/design_notes.md`.
 
 ## Two layers
 
 1. **Standard ESP-IDF WiFi promiscuous mode** — public API (`esp_wifi_set_promiscuous*`). Captures raw 802.11 frames regardless of modulation; doesn't by itself put the radio into 802.11p mode.
-2. **Private PHY retuning** — `phy_11p_set()` and `phy_change_channel()`, both `extern`-declared in `cmd_sniffer.c` (lines 173–174) with no header, no public ESP-IDF API, no source you can read in this tree. `phy_11p_set` resolves to a mask-ROM address (`esp-idf/components/esp_rom/esp32c5/ld/esp32c5.rom.eco3.ld`); `phy_change_channel` resolves into the precompiled `esp_wifi` blob libs (`esp-idf/components/esp_wifi/lib/`). These are undocumented hooks Espressif ships in the WiFi blob, likely for their own 802.11p/V2X experimentation — there is no reference for what every parameter does beyond what the source comments themselves guess.
+2. **Private PHY retuning** — `phy_11p_set()` and `phy_change_channel()`, both `extern`-declared in `cmd_sniffer.cpp` (lines 173–174) with no header, no public ESP-IDF API, no source you can read in this tree. `phy_11p_set` resolves to a mask-ROM address (`esp-idf/components/esp_rom/esp32c5/ld/esp32c5.rom.eco3.ld`); `phy_change_channel` resolves into the precompiled `esp_wifi` blob libs (`esp-idf/components/esp_wifi/lib/`). These are undocumented hooks Espressif ships in the WiFi blob, likely for their own 802.11p/V2X experimentation — there is no reference for what every parameter does beyond what the source comments themselves guess.
 
 802.11p differs from normal 802.11a at the PHY level: half-clocked timing, 10 MHz-wide channels instead of 20 MHz, "outside the context of a BSS" (OCB) operation — no association/beacon machinery. `phy_11p_set` is what reconfigures the PHY's clocking for this.
 
 ## The tuning sequence
 
-From `sniffer_start()` (`cmd_sniffer.c:203–217`), mirrored in `sniffer_resume()` (`:395–407`):
+From `sniffer_start()` (`cmd_sniffer.cpp:203–217`), mirrored in `sniffer_resume()` (`:395–407`):
 
 **1. Arm standard promiscuous capture** (still nominally a regular WiFi radio at this point):
 ```c
@@ -49,8 +49,8 @@ the standard ETSI ITS-G5 control/service channel frequencies. The middle two arg
 
 ## Known rough edges
 
-- **`SNIFFER_DEFAULT_CHANNEL` (`cmd_sniffer.c:30`) is `1`** — a leftover from whatever generic WiFi-channel-number sniffer example this was adapted from. Running `sniffer -P` without `-c` calls `phy_change_channel(1, ...)`, which is not a sensible 802.11p frequency.
-- **No range validation on `-c` in the interactive console path** (`do_sniffer_cmd`) — any integer is passed straight through to `phy_change_channel`. Only the NVS-autostart path (`sniffer_autostart`, `cmd_sniffer.c:373`) sanity-checks the value (`5800–5900`).
+- **`SNIFFER_DEFAULT_CHANNEL` (`cmd_sniffer.cpp:30`) is `1`** — a leftover from whatever generic WiFi-channel-number sniffer example this was adapted from. Running `sniffer -P` without `-c` calls `phy_change_channel(1, ...)`, which is not a sensible 802.11p frequency.
+- **No range validation on `-c` in the interactive console path** (`do_sniffer_cmd`) — any integer is passed straight through to `phy_change_channel`. Only the NVS-autostart path (`sniffer_autostart`, `cmd_sniffer.cpp:373`) sanity-checks the value (`5800–5900`).
 
 ## TX side: `tx_custom.c`
 

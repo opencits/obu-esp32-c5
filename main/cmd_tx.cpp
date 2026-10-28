@@ -35,11 +35,14 @@ static const char* ITS_HEADER_HEX =
 #define TX_MAX_INTERVAL_MS     3600000u  // keeps pdMS_TO_TICKS' ms*HZ product in 32 bit
 #define TX_DEFAULT_PAYLOAD_LEN 128
 #define TX_STATS_WINDOW_MS     1000
+#define TX_MAX_BURST           32
 
 /* ms between frames, <= 0 = stopped; tick-quantized (CONFIG_FREERTOS_HZ). */
 static std::atomic<int> txInterval{-1};
 /* random payload bytes after the header, 0..txMaxPayload(). */
 static std::atomic<int> txLength{TX_DEFAULT_PAYLOAD_LEN};
+/* frames sent back-to-back per interval, 1..TX_MAX_BURST. */
+static std::atomic<int> txBurstCount{1};
 
 static uint8_t txFrame[WIFI_TX_MAX_FRAME_LEN];
 static size_t txHeaderLen = 0;  // 0 until tx_header_init() decoded ITS_HEADER_HEX
@@ -57,6 +60,7 @@ static struct
     arg_int* datarate;
     arg_int* interval;
     arg_int* length;
+    arg_int* burst;
     arg_lit* stop;
     struct arg_end* end;
 } tx_args;
@@ -152,14 +156,24 @@ static void tx_task(void* arg)
         size_t payloadLen = (size_t)txLength.load();
         size_t len = txHeaderLen + payloadLen;
         fill_payload(txFrame + txHeaderLen, payloadLen, &rng);
-        if (WifiController::instance().txFrameRaw(txFrame, (uint16_t)len))
+
+        size_t burst = (size_t)txBurstCount.load();
+        for (size_t i = 0; i < burst; i++)
         {
-            frames++;
-            bytes += len;
-        }
-        else
-        {
-            errorCount++;
+            if (WifiController::instance().txFrameRaw(txFrame, (uint16_t)len))
+            {
+                frames++;
+                bytes += len;
+                if (burst > 1)
+                {
+                    esp_rom_delay_us(10);  // small gap between burst frames
+                }
+            }
+            else
+            {
+                errorCount++;
+                break;
+            }
         }
 
         TickType_t now = xTaskGetTickCount();
@@ -236,6 +250,16 @@ static int do_tx_cmd(int argc, char** argv)
         fprintf(stderr, "power must be 2..20 dBm\n");
         return 1;
     }
+    if (tx_args.burst->count)
+    {
+        int count = tx_args.burst->ival[0];
+        if (count < 1 || count > TX_MAX_BURST)
+        {
+            fprintf(stderr, "burst count must be 1..%d\n", TX_MAX_BURST);
+            return 1;
+        }
+        txBurstCount = count;
+    }
 
     if (!tx_task_ensure())
         return 1;
@@ -263,6 +287,7 @@ void register_tx_cmd(void)
     tx_args.datarate = arg_int0("r", "datarate", "<kbps>", "datarate");
     tx_args.power = arg_int0("p", "power", "<dbm>", "power 2..20");
     tx_args.interval = arg_int0("i", "interval", "<ms>", "interval");
+    tx_args.burst = arg_int0("b", "burst", "<count>", "frames per interval, 1..32");
     tx_args.length = arg_int0("l", "length", "<bytes>", "random payload bytes after the 34-byte header");
     tx_args.stop = arg_lit0(NULL, "stop", "stop running transmitter");
     tx_args.end = arg_end(1);
@@ -286,20 +311,28 @@ void start_tx_loop(uint8_t* frame, uint16_t frame_len, obu_comm_reply_fn reply, 
     memcpy(&req, frame, sizeof(req));
     uint32_t interval = ntohl(req.intervalMs);
     uint32_t length = ntohl(req.frameLen);
+    uint32_t burst = ntohl(req.burstCount);
     int32_t power = (int32_t)ntohl((uint32_t)req.txPower);
     uint32_t datarate = ntohl(req.datarate);
 
-    if (interval > TX_MAX_INTERVAL_MS || length > (uint32_t)txMaxPayload() ||
-        (power != 0 && !tx_power_valid(power)) || datarate > UINT16_MAX)
+    if (interval > TX_MAX_INTERVAL_MS ||
+        length > (uint32_t)txMaxPayload() ||
+        burst > TX_MAX_BURST ||
+        (power != 0 && !tx_power_valid(power)) ||
+        datarate > UINT16_MAX)
     {
-        ESP_LOGW(TAG, "TX_LOOP_START out of range: %lu ms, %lu bytes, %ld dBm, %lu kbps",
-                 (unsigned long)interval, (unsigned long)length, (long)power, (unsigned long)datarate);
-        reply(COMM_FRAME_CMD_FAIL, NULL, 0, ctx);
+        ESP_LOGW(TAG, "TX_LOOP_START out of range: %lu ms, %lu bytes, %lu burst, %ld dBm, %lu kbps",
+                 (unsigned long)interval,
+                 (unsigned long)length,
+                 (unsigned long)burst,
+                 (long)power,
+                 (unsigned long)datarate);
+        reply(COMM_FRAME_CMD_FAIL, nullptr, 0, ctx);
         return;
     }
     if (!tx_task_ensure())
     {
-        reply(COMM_FRAME_CMD_FAIL, NULL, 0, ctx);
+        reply(COMM_FRAME_CMD_FAIL, nullptr, 0, ctx);
         return;
     }
     if (datarate != 0)
@@ -314,14 +347,18 @@ void start_tx_loop(uint8_t* frame, uint16_t frame_len, obu_comm_reply_fn reply, 
     {
         txLength = (int)length;
     }
+    if (burst != 0)
+    {
+        txBurstCount = (int)burst;
+    }
     txInterval = interval ? (int)interval : TX_DEFAULT_INTERVAL_MS;
-    reply(COMM_FRAME_CMD_GOOD, NULL, 0, ctx);
+    reply(COMM_FRAME_CMD_GOOD, nullptr, 0, ctx);
 }
 
 void stop_tx_loop(obu_comm_reply_fn reply, void* ctx)
 {
     txInterval = -1;
-    reply(COMM_FRAME_CMD_GOOD, NULL, 0, ctx);
+    reply(COMM_FRAME_CMD_GOOD, nullptr, 0, ctx);
 }
 
 void status_tx_loop(obu_comm_reply_fn reply, void* ctx)
@@ -332,6 +369,7 @@ void status_tx_loop(obu_comm_reply_fn reply, void* ctx)
     len += snprintf(buffer + len, sizeof(buffer) - len, ",\"bps\":%.02f", bytesPerSecond);
     len += snprintf(buffer + len, sizeof(buffer) - len, ",\"err\":%lu", (unsigned long)errorCount.load());
     len += snprintf(buffer + len, sizeof(buffer) - len, ",\"interval\":%d", txInterval.load());
+    len += snprintf(buffer + len, sizeof(buffer) - len, ",\"burst\":%d", txBurstCount.load());
     len += snprintf(buffer + len, sizeof(buffer) - len, ",\"len\":%d", (int)txHeaderLen + txLength.load());
     len += snprintf(buffer + len, sizeof(buffer) - len, "}");
 

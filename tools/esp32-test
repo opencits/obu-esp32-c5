@@ -40,8 +40,9 @@ FW_END_TIMEOUT_S = 15.0
 FW_RETRIES = 5
 
 # TX loop (main/cmd_tx.cpp): TxStartPayload, 0 in any field = device default/keep current
-TX_START = struct.Struct(">IIiI")   # intervalMs, frameLen (random payload bytes), txPower dBm, datarate kbps
+TX_START = struct.Struct(">IIIiI")  # intervalMs, burstCount, frameLen (random payload bytes), txPower dBm, datarate kbps
 TX_MAX_INTERVAL_MS = 3600000
+TX_MAX_BURST = 32                   # frames sent back-to-back per interval
 TX_MAX_PAYLOAD = 1500 - 34          # WIFI_TX_MAX_FRAME_LEN - ITS header
 TX_DATARATES = (3000, 4500, 6000, 9000, 12000, 18000, 24000, 27000)   # 802.11p 10 MHz, kbps
 
@@ -373,8 +374,8 @@ def cmd_chan(dev: Device, chan: int) -> int:
     return 0
 
 
-def tx_start(dev: Device, interval: int, length: int, power: int, datarate: int) -> bool:
-    t, _ = dev.request(TX_LOOP_START, TX_START.pack(interval, length, power, datarate),
+def tx_start(dev: Device, interval: int, burst: int, length: int, power: int, datarate: int) -> bool:
+    t, _ = dev.request(TX_LOOP_START, TX_START.pack(interval, burst, length, power, datarate),
                        (CMD_GOOD, CMD_FAIL))
     if t != CMD_GOOD:
         print("TX_LOOP_START " + ("rejected (out of range)" if t == CMD_FAIL
@@ -388,7 +389,7 @@ def tx_status(dev: Device) -> dict | None:
     return _json(p) if t == TX_LOOP_STATUS else None
 
 
-def cmd_monitor(dev: Device, rx: bool, with_cbr: bool, tx: tuple[int, int, int, int] | None) -> int:
+def cmd_monitor(dev: Device, rx: bool, with_cbr: bool, tx: tuple[int, int, int, int, int] | None) -> int:
     """One self-overwriting status line every INTERVAL_S for RX and/or TX until Ctrl-C."""
     frames = 0
     nbytes = 0
@@ -436,6 +437,7 @@ def cmd_monitor(dev: Device, rx: bool, with_cbr: bool, tx: tuple[int, int, int, 
                 else:
                     parts.append(f"TX: {float(st.get('fps', 0)):7.1f} fps "
                                  f"{float(st.get('bps', 0)):9.0f} B/s  len {st.get('len', '?')}  "
+                                 f"burst {st.get('burst', '?')}  "
                                  f"err {st.get('err', '?')}")
             # PING doubles as keepalive: the device drops its coex hold after 30 s of host silence
             dev.send(PING)
@@ -475,7 +477,8 @@ def main() -> int:
                "  esp32-test --chan 5880 --rx --cbr\n"
                "  esp32-test --port COM7 --rx\n"
                "  esp32-test --flash cmake-build-esp32c5/obu-esp32-c5.bin\n"
-               "  esp32-test --tx --tx-interval 10 --tx-length 300 --tx-power 20",
+               "  esp32-test --tx --tx-interval 10 --tx-length 300 --tx-power 20\n"
+               "  esp32-test --tx --tx-interval 100 --tx-burst 8",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--status", action="store_true", help="print FW version, counters, config, CBR")
@@ -486,6 +489,9 @@ def main() -> int:
                    help="start TX test loop, print TX status every 2 s until Ctrl-C (stops loop)")
     p.add_argument("--tx-interval", type=_int_range(1, TX_MAX_INTERVAL_MS), metavar="MS",
                    help="ms between frames (default 1000; 10 ms granularity); implies --tx")
+    p.add_argument("--tx-burst", type=_int_range(1, TX_MAX_BURST), metavar="N",
+                   help=f"frames sent back-to-back per interval, 1..{TX_MAX_BURST} "
+                        "(default: device current, 1 at boot); implies --tx")
     p.add_argument("--tx-length", type=_int_range(0, TX_MAX_PAYLOAD), metavar="BYTES",
                    help=f"random payload bytes after the 34-byte header, 0..{TX_MAX_PAYLOAD} "
                         "(default: device current, 128 at boot); implies --tx")
@@ -513,7 +519,7 @@ def main() -> int:
             print(f"{pt.device:<14} {pt.description}{vid_pid}")
         return 0
 
-    tx_tune = (args.tx_interval, args.tx_length, args.tx_power, args.tx_datarate)
+    tx_tune = (args.tx_interval, args.tx_burst, args.tx_length, args.tx_power, args.tx_datarate)
     args.tx = args.tx or any(v is not None for v in tx_tune)
     if not (args.status or args.rx or args.cbr or args.chan or args.flash or args.tx):
         p.print_help()

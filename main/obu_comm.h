@@ -96,6 +96,7 @@ typedef struct {
  * out of range. Frame = fixed 34-byte ITS header + random payload (cmd_tx.cpp). */
 typedef struct {
   uint32_t intervalMs;   // 1..3600000 ms, 0 = 1000; tick-quantized (10 ms at HZ=100)
+  uint32_t burstCount;   // frames per interval, 1..32; 0 = keep current (1 at boot)
   uint32_t frameLen;     // random payload bytes after the header, 0..1466; 0 = keep current (128 at boot)
   int32_t  txPower;      // 2..20 dBm, 0 = keep current
   uint32_t datarate;     // kbps (3000..27000, 802.11p 10 MHz), 0 = keep current

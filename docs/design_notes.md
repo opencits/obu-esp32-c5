@@ -67,7 +67,7 @@ length-prefixed binary framing and share one dispatcher, so the protocol only ne
   - `COMM_FRAME_FW_*` → wire-protocol FW update, see OTA below.
   - `COMM_FRAME_TX_LOOP_START/STOP/STATUS` → random-payload TX test loop (`cmd_tx.cpp`, see Transmit pipeline).
     START payload `TxStartPayload`, replies `CMD_GOOD`/`_FAIL`; STATUS replies with its own type + JSON
-    `{"fps","bps","err","interval","len"}`.
+    `{"fps","bps","err","interval","burst","len"}`.
   - `COMM_FRAME_TX` → payload is `CommFrameHeader` + raw 802.11 frame bytes, handed to `WifiController::txFrame()` (see Transmit pipeline). No reply is sent either way.
   - `COMM_FRAME_RX` → sink-only, sent *from* device to client for each captured frame (not dispatched, no client can send it in).
 - `CFG:key=value` sub-protocol (`handle_config_command`/`cfg_key_to_index` in `obu_comm.cpp`): maps a fixed set of
@@ -124,9 +124,10 @@ length-prefixed binary framing and share one dispatcher, so the protocol only ne
 - `cmd_tx.cpp` TX loop: fixed 34-byte 802.11 QoS-data + LLC/SNAP (0x8947) header (`ITS_HEADER_HEX`) + random
   payload (xorshift32 seeded from `esp_random()`, refilled per frame; `esp_fill_random` is too slow per frame), sent
   via `WifiController::txFrameRaw` (no `CommFrameHeader`; uses `setDatarate()` rate, counts into `stats()`). Driven by
-  the `tx` console command (`-i <ms>` default 1000, `-l <payload bytes>` default 128, `-p`, `-r`, `--stop`) or the
+  the `tx` console command (`-i <ms>` default 1000, `-b <burst>` 1..32 frames per interval, default 1, `-l <payload bytes>`
+  default 128, `-p`, `-r`, `--stop`) or the
   wire protocol `TX_LOOP_START`/`STOP`/`STATUS` (`TxStartPayload` in `obu_comm.h`; STATUS replies with its own type,
-  JSON). Paced by `vTaskDelayUntil`, so interval is tick-quantized (10 ms at `CONFIG_FREERTOS_HZ=100`, max 100 fps).
+  JSON). Paced by `vTaskDelayUntil`, so interval is tick-quantized (10 ms at `CONFIG_FREERTOS_HZ=100`, max 100 intervals/s). A burst sends its frames back-to-back (10 µs gap, same payload), stopping at the first TX error.
   Frame length capped at `WIFI_TX_MAX_FRAME_LEN` (1500, `esp_wifi_80211_tx` limit).
 - Starting the TX loop takes a BLE/sniffer coex hold (`WifiController::coexHold()`), never released, for the lifetime of
   the task, then `resumeForce()` so the radio is frozen *active* even if the hold landed in a BLE window (else

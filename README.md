@@ -71,7 +71,7 @@ Needs Python 3.8+ and `pyserial` (`pip install pyserial`). Without arguments it 
 tools/esp32-test --status                    # FW version, rx/tx counters, config, CBR
 tools/esp32-test --rx --cbr                  # RX fps / B/s + CBR %, one line, every 2 s, Ctrl-C stops
 tools/esp32-test --chan 5880                 # store autostart channel (5860..5920) and reboot the device
-tools/esp32-test --tx --tx-interval 10 --tx-length 300 [--tx-power 20] [--tx-datarate 6000]
+tools/esp32-test --tx --tx-interval 10 --tx-length 300 [--tx-burst 8] [--tx-power 20] [--tx-datarate 6000]
 tools/esp32-test --flash cmake-build-esp32c5/obu-esp32-c5.bin   # FW update via FW_BEGIN/DATA/END, reboot, confirm
 tools/esp32-test --list-ports                # port is auto-detected (VID 0x303A), override with --port
 ```

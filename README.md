@@ -55,7 +55,7 @@ CLion can build the firmware with plain CMake. You don't need `idf.py`, but ESP-
 4. In Settings → … → CMake, enable the **ESP-IDF esp32c5** profile. Disable any default profile that uses the
    host compiler. Then reload the CMake project and build (Ctrl+F9).
 
-CLion builds into `cmake-build-esp32c5/`. Note: once `CMakeUserPresets.json` exists, `idf.py build` (ESP-IDF 6.0)
+CLion builds into `cmake-build-esp32c5/`. Note: once `CMakeUserPresets.json` exists, `idf.py build` (ESP-IDF 6.x)
 picks up its first preset too and also builds into `cmake-build-esp32c5/` — `build/` then goes stale, so flash
 images from `cmake-build-esp32c5/`. Both use the same `sdkconfig` in the repo root. ESP-IDF's `flash`, `app-flash`,
 `size`, `menuconfig` and `monitor` targets appear in CLion's target list. `flash` uses the `ESPPORT`
